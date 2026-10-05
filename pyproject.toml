@@ -1,0 +1,67 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mojo-gate"
+version = "0.1.0"
+description = "High-performance Mojo reverse proxy and caching gateway drop-in for Uvicorn"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    { name = "morawskidotmy" }
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
+]
+dependencies = [
+    "uvicorn>=0.20.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "fastapi>=0.100.0",
+    "httpx>=0.24.0",
+]
+
+[project.scripts]
+mojo-gate = "mojo_gate.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mojo_gate", "src/mojo"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+  "E",   # pycodestyle errors
+  "F",   # pyflakes
+  "I",   # isort
+  "B",   # flake8-bugbear
+  "UP",  # pyupgrade
+  "C901",# mccabe complexity
+  "SIM", # flake8-simplify
+  "PTH", # flake8-use-pathlib
+  "C4",  # flake8-comprehensions
+  "PIE", # flake8-pie
+  "RUF", # ruff-specific rules
+  "DTZ", # flake8-datetimez
+  "RET", # flake8-return
+  "ARG", # flake8-unused-arguments
+  "PERF" # perflint
+]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 15
+
