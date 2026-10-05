@@ -1,6 +1,6 @@
 """Run any Uvicorn application behind the Mojo front proxy (``src/mojo/gate.mojo``).
 
-Matches the front proxy pattern from ``search.matugen``:
+The front proxy architecture:
 - The Mojo proxy listens on the public port (``--port``) and the Python app on
   an internal upstream port (``--upstream-port``) with ``MOJO_GATE_FRONT_PROXY=1``.
 - The proxy enforces rate limits, serves cached responses for safe GET/HEAD requests,

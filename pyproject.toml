@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "High-performance Mojo reverse proxy and caching gateway drop-in for Uvicorn"
 readme = "README.md"
 requires-python = ">=3.10"
-license = "MIT"
+license = "AGPL-3.0-or-later"
 authors = [
     { name = "morawskidotmy", email = "morawskidotmy@users.noreply.github.com" }
 ]
