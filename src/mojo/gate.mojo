@@ -24,10 +24,14 @@ comptime SOCK_STREAM = 1
 comptime SOL_SOCKET = 1
 comptime SO_REUSEADDR = 2
 comptime SO_ERROR = 4
+comptime SO_REUSEPORT = 15
 comptime SO_RCVTIMEO = 20
 comptime SO_SNDTIMEO = 21
 comptime IPPROTO_TCP = 6
 comptime TCP_NODELAY = 1
+comptime TCP_DEFER_ACCEPT = 9
+comptime SOCK_NONBLOCK = 0x800
+comptime SOCK_CLOEXEC = 0x80000
 comptime FIONBIO = 0x5421
 comptime EAGAIN = 11
 comptime EINPROGRESS = 115
@@ -760,6 +764,8 @@ struct Proxy:
     var buckets: Dict[String, List[Int]]  # "ip|prefix" -> request times (ms)
     var hits: List[String]                # analytics JSON items to report
     var tmp: List[UInt8]
+    var cached_date_sec: Int
+    var cached_date_str: String
 
     def __init__(out self, upstream_host_ip: UInt32, upstream_port: Int,
                  cache_ttl_s: Int, cache_max_bytes: Int, entry_max_bytes: Int,
@@ -787,6 +793,15 @@ struct Proxy:
         self.buckets = Dict[String, List[Int]]()
         self.hits = List[String]()
         self.tmp = List[UInt8](length=65536, fill=0)
+        self.cached_date_sec = 0
+        self.cached_date_str = http_date()
+
+    def current_date(mut self) -> String:
+        var now = now_s()
+        if now != self.cached_date_sec:
+            self.cached_date_sec = now
+            self.cached_date_str = http_date()
+        return self.cached_date_str
 
     def slot(mut self, fd: Int):
         while len(self.conns) <= fd:
@@ -828,7 +843,28 @@ struct Proxy:
     # -- output ---------------------------------------------------------------
 
     def send_bytes(mut self, fd: Int, data: List[UInt8]):
-        self.conns[fd].out.extend(data.copy())
+        if fd < 0 or fd >= len(self.conns) or not self.conns[fd].active:
+            return
+        if len(self.conns[fd].out) == 0:
+            var n = external_call["send", Int](
+                c_int(fd), data.unsafe_ptr(),
+                c_size_t(len(data)), c_int(0x4000))  # MSG_NOSIGNAL
+            if n == len(data):
+                if self.conns[fd].close_after and not self.conns[fd].upstream:
+                    self.close_fd(fd)
+                return
+            elif n > 0:
+                for k in range(n, len(data)):
+                    self.conns[fd].out.append(data[k])
+                self.conns[fd].out_off = 0
+                if not self.conns[fd].want_out:
+                    self.watch(fd, True, False)
+                return
+            elif n < 0 and errno() != EAGAIN:
+                self.close_fd(fd)
+                return
+        for k in range(len(data)):
+            self.conns[fd].out.append(data[k])
         self.flush(fd)
 
     def flush(mut self, fd: Int):
@@ -846,7 +882,7 @@ struct Proxy:
                 return
             self.conns[fd].out_off += n
         if self.conns[fd].out_off >= len(self.conns[fd].out):
-            self.conns[fd].out = List[UInt8]()
+            self.conns[fd].out.clear()
             self.conns[fd].out_off = 0
             if self.conns[fd].want_out:
                 self.watch(fd, False, False)
@@ -1331,7 +1367,7 @@ struct Proxy:
             if key not in self.cache or now_s() - self.cache[key].born >= self.cache_ttl_s:
                 return False
             out.extend(self.cache[key].status_line.copy())
-            append_str(out, "date: " + http_date() + "\r\n")
+            append_str(out, "date: " + self.current_date() + "\r\n")
             if keep:
                 out.extend(self.cache[key].rest_keep.copy())
             else:
@@ -1632,12 +1668,14 @@ def main() raises:
         return
     var on = c_int(1)
     _ = external_call["setsockopt", c_int](lfd, c_int(SOL_SOCKET), c_int(SO_REUSEADDR), Pointer(to=on), c_size_t(4))
+    _ = external_call["setsockopt", c_int](lfd, c_int(SOL_SOCKET), c_int(SO_REUSEPORT), Pointer(to=on), c_size_t(4))
+    _ = external_call["setsockopt", c_int](lfd, c_int(IPPROTO_TCP), c_int(TCP_DEFER_ACCEPT), Pointer(to=on), c_size_t(4))
     var addr = SockAddrIn(port, host_ip)
     if external_call["bind", c_int](lfd, Pointer(to=addr), c_int(size_of[SockAddrIn]())) < 0:
         print("[mojo-gate] error: cannot bind " + host_str + ":" + String(port))
         _ = external_call["close", c_int](lfd)
         return
-    _ = external_call["listen", c_int](lfd, c_int(1024))
+    _ = external_call["listen", c_int](lfd, c_int(4096))
     _ = external_call["ioctl", c_int](lfd, c_int(FIONBIO), Pointer(to=on))
     p.listen_fd = lfd
     p.epfd = external_call["epoll_create1", c_int](c_int(0))
@@ -1659,17 +1697,19 @@ def main() raises:
         for k in range(Int(nfds)):
             var fd = Int(events[k].fd)
             if fd == Int(lfd):
-                while True:
+                var accepted = 0
+                while accepted < 64:
                     var caddr_len = c_int(size_of[SockAddrIn]())
-                    var cfd = Int(external_call["accept", c_int](lfd, Pointer(to=caddr), Pointer(to=caddr_len)))
+                    var cfd = Int(external_call["accept4", c_int](lfd, Pointer(to=caddr), Pointer(to=caddr_len),
+                                                                 c_int(SOCK_NONBLOCK | SOCK_CLOEXEC)))
                     if cfd < 0:
                         break
-                    _ = external_call["ioctl", c_int](c_int(cfd), c_int(FIONBIO), Pointer(to=on))
                     _ = external_call["setsockopt", c_int](c_int(cfd), c_int(IPPROTO_TCP), c_int(TCP_NODELAY),
                                                            Pointer(to=on), c_size_t(4))
                     p.open_fd(cfd, False)
                     p.conns[cfd].client_ip = format_ipv4(caddr.sin_addr)
                     p.watch(cfd, False, True)
+                    accepted += 1
             else:
                 p.on_event(fd, events[k].events)
 
