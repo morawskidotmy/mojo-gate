@@ -461,12 +461,14 @@ def parse_request(buf: List[UInt8], internal_token: String = "") -> Request:
     for b in r.target.as_bytes():
         if b > 126 or b < 33:
             r.non_ascii = True
-    var q = r.target.find("?")
+    var target_bytes = percent_decode_bytes(r.target)
+    var target_str = latin1(target_bytes, 0, len(target_bytes))
+    var q = target_str.find("?")
     if q >= 0:
-        r.raw_path = normalize_path(String(r.target[byte=0:q]))
-        r.raw_query = String(r.target[byte=q + 1:r.target.byte_length()])
+        r.raw_path = normalize_path(String(target_str[byte=0:q]))
+        r.raw_query = String(target_str[byte=q + 1:target_str.byte_length()])
     else:
-        r.raw_path = normalize_path(r.target)
+        r.raw_path = normalize_path(target_str)
     var pos = i + 2
     var first_xff = True
     var have_ae = False
@@ -526,7 +528,7 @@ def parse_request(buf: List[UInt8], internal_token: String = "") -> Request:
                 r.bad_status = 400
                 return r^
             var lv = lower_ascii(value)
-            if lv.find("chunked") >= 0:
+            if lv == "chunked":
                 r.chunked = True
             else:
                 r.ok = False
@@ -1056,7 +1058,7 @@ struct Proxy:
     def is_cacheable(self, r: Request) -> Bool:
         if not (r.method == "GET" or r.method == "HEAD"):
             return False
-        if r.version != "HTTP/1.1" or r.uncacheable_hdr or r.non_ascii or r.body_len > 0:
+        if r.version != "HTTP/1.1" or r.uncacheable_hdr or r.non_ascii or r.body_len > 0 or r.chunked:
             return False
         if r.target.byte_length() > MAX_TARGET_BYTES:
             return False
@@ -1458,6 +1460,7 @@ def main() raises:
     var no_cache_prefixes_str = String("/_mojo_gate")
     var analytics_endpoint = String("")
     var purge_endpoint = String("/_mojo_gate/purge")
+    var internal_token = String("")
 
     var args = argv()
     var i = 1
@@ -1502,8 +1505,8 @@ def main() raises:
         elif a == "--analytics-endpoint" and i + 1 < len(args):
             analytics_endpoint = String(args[i + 1])
             i += 2
-        elif a == "--purge-endpoint" and i + 1 < len(args):
-            purge_endpoint = String(args[i + 1])
+        elif a == "--internal-token" and i + 1 < len(args):
+            internal_token = String(args[i + 1])
             i += 2
         else:
             i += 1
@@ -1515,7 +1518,7 @@ def main() raises:
 
     var p = Proxy(upstream_host_ip, upstream_port, cache_ttl, cache_max_bytes, entry_max_bytes,
                   rate_limit, rate_rules^, rate_limit_msg, no_cache_prefixes^,
-                  analytics_endpoint, purge_endpoint)
+                  analytics_endpoint, purge_endpoint, internal_token)
 
     var lfd = external_call["socket", c_int](c_int(AF_INET), c_int(SOCK_STREAM), c_int(0))
     if lfd < 0:
