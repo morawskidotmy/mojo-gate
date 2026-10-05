@@ -45,6 +45,7 @@ comptime MAX_HEADER_BYTES = 65536
 comptime MAX_TARGET_BYTES = 4096
 comptime MAX_INBUF_BYTES = 16777216  # 16 MB max buffered client bytes
 comptime MAX_BUCKETS = 65536
+comptime MAX_HITS = 2048
 
 # Client connection states
 comptime C_IDLE = 0      # reading / parsing requests
@@ -122,6 +123,7 @@ struct Conn(Copyable, Movable):
     var chunked: Bool
     var body_seen: Int
     var client_ip: String
+    var last_active: Int
 
     def __init__(out self):
         self.active = False
@@ -143,6 +145,7 @@ struct Conn(Copyable, Movable):
         self.chunked = False
         self.body_seen = 0
         self.client_ip = String("127.0.0.1")
+        self.last_active = now_s()
 
 
 struct Entry(Copyable, Movable):
@@ -229,6 +232,20 @@ def format_ipv4(addr: UInt32) -> String:
     var c = Int((addr >> 16) & 0xFF)
     var d = Int((addr >> 24) & 0xFF)
     return String(a) + "." + String(b) + "." + String(c) + "." + String(d)
+
+
+def is_valid_tchar(b: UInt8) -> Bool:
+    var c = Int(b)
+    # ALPHA (A-Z, a-z)
+    if (c >= 65 and c <= 90) or (c >= 97 and c <= 122):
+        return True
+    # DIGIT (0-9)
+    if c >= 48 and c <= 57:
+        return True
+    # RFC 9110 symbols: ! # $ % & ' * + - . ^ _ ` | ~
+    return (c == 33 or c == 35 or c == 36 or c == 37 or c == 38 or c == 39
+            or c == 42 or c == 43 or c == 45 or c == 46 or c == 94 or c == 95
+            or c == 96 or c == 124 or c == 126)
 
 
 def normalize_path(p: String) -> String:
@@ -458,6 +475,30 @@ def parse_request(buf: List[UInt8], internal_token: String = "") -> Request:
     r.method = String(parts[0])
     r.target = String(parts[1])
     r.version = String(parts[2])
+
+    # Validate HTTP method tchar (RFC 9110 §5.6.2)
+    if r.method.byte_length() == 0:
+        r.ok = False
+        r.bad_status = 400
+        return r^
+    for b in r.method.as_bytes():
+        if not is_valid_tchar(b):
+            r.ok = False
+            r.bad_status = 400
+            return r^
+
+    # Validate target length (RFC 9112 §3)
+    if r.target.byte_length() > MAX_TARGET_BYTES:
+        r.ok = False
+        r.bad_status = 414  # URI Too Long
+        return r^
+
+    # Validate HTTP version (RFC 9112 §2.3)
+    if r.version != "HTTP/1.1" and r.version != "HTTP/1.0":
+        r.ok = False
+        r.bad_status = 400
+        return r^
+
     for b in r.target.as_bytes():
         if b > 126 or b < 33:
             r.non_ascii = True
@@ -489,6 +530,11 @@ def parse_request(buf: List[UInt8], internal_token: String = "") -> Request:
                 return r^
             if b > 126:
                 r.non_ascii = True
+        # Disallow leading whitespace in header lines (RFC 9112 §5.2)
+        if buf[pos] == 32 or buf[pos] == 9:
+            r.ok = False
+            r.bad_status = 400
+            return r^
         var hl = latin1(buf, pos, e)
         var colon = hl.find(":")
         if colon <= 0 or (colon > 0 and (hl.as_bytes()[colon - 1] == 32 or hl.as_bytes()[colon - 1] == 9)):
@@ -496,6 +542,12 @@ def parse_request(buf: List[UInt8], internal_token: String = "") -> Request:
             r.ok = False
             r.bad_status = 400
             return r^
+        # Validate header name characters (RFC 9110 token)
+        for byte_idx in range(colon):
+            if not is_valid_tchar(hl.as_bytes()[byte_idx]):
+                r.ok = False
+                r.bad_status = 400
+                return r^
         r.lines.append(hl)
         var name = lower_ascii(String(hl[byte=0:colon]))
         var value = strip_ws(String(hl[byte=colon + 1:hl.byte_length()]))
@@ -563,7 +615,12 @@ def parse_request(buf: List[UInt8], internal_token: String = "") -> Request:
         elif name == "origin":
             r.has_origin = True
         elif name == "host":
-            r.host = value
+            if r.host.byte_length() > 0:
+                # Reject duplicate Host header (RFC 9112 §7.1)
+                r.ok = False
+                r.bad_status = 400
+                return r^
+            r.host = lower_ascii(value)
         elif name == "x-forwarded-proto":
             r.xfp = value
         elif name == "x-forwarded-host":
@@ -579,6 +636,11 @@ def parse_request(buf: List[UInt8], internal_token: String = "") -> Request:
               or name == "if-unmodified-since"):
             r.uncacheable_hdr = True
         pos = e + 2
+    if r.version == "HTTP/1.1" and r.host.byte_length() == 0:
+        # HTTP/1.1 requires a Host header (RFC 9112 §7.1)
+        r.ok = False
+        r.bad_status = 400
+        return r^
     r.body_len = body_len
     r.ok = True
     return r^
@@ -619,10 +681,16 @@ def parse_host(value: String) -> String:
     return value
 
 
-def cache_key(r: Request) -> String:
-    return (r.method + " " + r.target + " g" + ("1" if r.accept_gzip else "0")
-            + " o" + ("1" if r.has_origin else "0") + " h" + r.host
-            + " p" + r.xfp + " x" + r.xfh)
+def cache_key(r: Request, is_loopback: Bool) -> String:
+    var base = r.method + "\x1f" + r.raw_path
+    if r.raw_query.byte_length() > 0:
+        base += "?" + r.raw_query
+    base += "\x1fg" + ("1" if r.accept_gzip else "0")
+    base += "\x1fo" + ("1" if r.has_origin else "0")
+    base += "\x1fh" + r.host
+    if is_loopback:
+        base += "\x1fp" + r.xfp + "\x1fx" + r.xfh
+    return base
 
 
 def upstream_request(r: Request, buf: List[UInt8], client_ip: String) -> List[UInt8]:
@@ -636,7 +704,8 @@ def upstream_request(r: Request, buf: List[UInt8], client_ip: String) -> List[UI
         var colon = l.find(":")
         if colon > 0:
             var name = lower_ascii(String(l[byte=0:colon]))
-            if name == "connection" or name == "keep-alive" or name == "proxy-connection":
+            if (name == "connection" or name == "keep-alive" or name == "proxy-connection"
+                or name == "x-mojo-gate-token"):
                 continue
             if name == "x-forwarded-for":
                 append_str(out, "X-Forwarded-For: " + r.xff + ", " + client_ip + "\r\n")
@@ -744,6 +813,8 @@ struct Proxy:
             elif self.conns[peer].state == C_TUNNEL:
                 self.conns[peer].close_after = True
                 self.flush(peer)
+            elif self.conns[peer].state == C_WAITING:
+                self.bad_gateway(peer)
 
     # -- output ---------------------------------------------------------------
 
@@ -898,6 +969,16 @@ struct Proxy:
                 var lv = lower_ascii(value)
                 if lv.find("*") >= 0:
                     no_store = True
+            elif name == "content-range":
+                no_store = True
+        if cl >= 0 and chunked:
+            # Dual framing from upstream: reject with 502 Bad Gateway
+            self.bad_gateway(client)
+            self.close_fd(ufd)
+            return
+        if status == 101:
+            self.conns[client].state = C_TUNNEL
+            self.conns[ufd].state = C_TUNNEL
         var no_body = self.conns[ufd].head_req or status == 204 or status == 304 or (status >= 100 and status < 200)
         var delimited = no_body or cl >= 0 or chunked
         var keep = self.conns[client].keep_alive and delimited
@@ -906,7 +987,7 @@ struct Proxy:
         self.conns[ufd].chunked = chunked and not no_body
         self.conns[ufd].hdr_done = True
         self.conns[ufd].body_seen = len(resp) - hend
-        if self.conns[ufd].cache_key.byte_length() > 0 and status == 200 and not set_cookie and not no_store and delimited:
+        if self.conns[ufd].cache_key.byte_length() > 0 and status == 200 and not set_cookie and not no_store and not chunked and delimited:
             self.conns[ufd].capture = True
         else:
             self.conns[ufd].capture = False
@@ -972,12 +1053,10 @@ struct Proxy:
         if hend < 0:
             return
         var body_len = len(resp) - hend
-        if self.conns[ufd].cl >= 0 and not self.conns[ufd].chunked and body_len != self.conns[ufd].cl:
-            return  # truncated
         if self.conns[ufd].chunked:
-            if body_len < 5 or not (resp[len(resp) - 5] == 48 and resp[len(resp) - 4] == 13
-                                     and resp[len(resp) - 1] == 10):
-                return
+            return  # never cache chunked responses
+        if self.conns[ufd].cl >= 0 and body_len != self.conns[ufd].cl:
+            return  # truncated
 
         # Find status line end
         var sl_end = 0
@@ -1177,7 +1256,7 @@ struct Proxy:
                     self.bad_request(client, "Malformed request or invalid headers")
                 return
             if r.chunked or r.upgrade or r.expect or r.method == "CONNECT":
-                self.start_tunnel(client)
+                self.start_tunnel(client, r, inbuf)
                 return
             if len(inbuf) < r.head_len + r.body_len:
                 return  # wait for the body
@@ -1220,9 +1299,9 @@ struct Proxy:
 
             var key = String("")
             if self.is_cacheable(r):
-                key = cache_key(r)
+                key = cache_key(r, ip == "127.0.0.1" or ip == "::1")
                 if self.replay(client, key, keep):
-                    if self.analytics_endpoint.byte_length() > 0:
+                    if self.analytics_endpoint.byte_length() > 0 and len(self.hits) < MAX_HITS:
                         self.hits.append("[" + json_str(r.raw_path) + "," + json_str(r.raw_query) + ","
                                          + json_str(ip) + "," + json_str(r.user_agent) + "]")
                     if not keep:
@@ -1264,13 +1343,17 @@ struct Proxy:
         self.conns[ufd].head_req = r.method == "HEAD"
         self.conns[ufd].out = upstream_request(r, inbuf, self.conns[client].client_ip)
 
-    def start_tunnel(mut self, client: Int):
+    def start_tunnel(mut self, client: Int, r: Request, inbuf: List[UInt8]):
         var ufd = self.connect_upstream(client)
         if ufd < 0:
             self.bad_gateway(client)
             return
-        self.conns[client].state = C_TUNNEL
-        self.conns[ufd].out = self.conns[client].inbuf.copy()
+        if r.upgrade:
+            # For HTTP Upgrade (e.g. WebSocket), wait for upstream to answer 101 Switching Protocols
+            self.conns[client].state = C_WAITING
+        else:
+            self.conns[client].state = C_TUNNEL
+        self.conns[ufd].out = upstream_request(r, inbuf, self.conns[client].client_ip)
         self.conns[client].inbuf = List[UInt8]()
 
     # -- event handlers ------------------------------------------------------------
@@ -1293,6 +1376,7 @@ struct Proxy:
     def on_event(mut self, fd: Int, events: UInt32):
         if fd >= len(self.conns) or not self.conns[fd].active:
             return
+        self.conns[fd].last_active = now_s()
         if self.conns[fd].upstream and self.conns[fd].state == U_CONNECTING:
             if (events & UInt32(EPOLLOUT | EPOLLERR | EPOLLHUP)) != 0:
                 var err = c_int(0)
@@ -1358,7 +1442,9 @@ struct Proxy:
         if external_call["connect", c_int](fd, Pointer(to=addr), c_int(size_of[SockAddrIn]())) == 0:
             var req = List[UInt8]()
             append_str(req, "POST " + self.analytics_endpoint + " HTTP/1.1\r\nHost: 127.0.0.1\r\n"
-                       + "Content-Type: application/json\r\nConnection: close\r\nContent-Length: "
+                       + "Content-Type: application/json\r\nConnection: close\r\n"
+                       + (("X-Mojo-Gate-Token: " + self.internal_token + "\r\n") if self.internal_token.byte_length() > 0 else "")
+                       + "Content-Length: "
                        + String(body.byte_length()) + "\r\n\r\n" + body)
             var off = 0
             while off < len(req):
@@ -1383,6 +1469,12 @@ struct Proxy:
                 _ = self.buckets.pop(k)
             except:
                 pass
+
+    def reap_stale(mut self, now: Int):
+        for fd in range(len(self.conns)):
+            if self.conns[fd].active and not self.conns[fd].upstream:
+                if now - self.conns[fd].last_active > 30:
+                    self.close_fd(fd)
 
 
 # ─── command-line and main ───────────────────────────────────────────────────
@@ -1562,6 +1654,7 @@ def main() raises:
                     _ = external_call["setsockopt", c_int](c_int(cfd), c_int(IPPROTO_TCP), c_int(TCP_NODELAY),
                                                            Pointer(to=on), c_size_t(4))
                     p.open_fd(cfd, False)
+                    p.conns[cfd].client_ip = format_ipv4(caddr.sin_addr)
                     p.watch(cfd, False, True)
             else:
                 p.on_event(fd, events[k].events)
@@ -1571,7 +1664,8 @@ def main() raises:
             last_tick = now
             p.report_hits()
 
-        if now - last_sweep >= 10:
+        if now - last_sweep >= 5:
             last_sweep = now
             p.sweep()
             p.prune_buckets()
+            p.reap_stale(now)

@@ -191,5 +191,7 @@ def serve(
                 proxy_proc[0].wait(timeout=2)
             if proxy_proc[0].poll() is None:
                 proxy_proc[0].kill()
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proxy_proc[0].wait(timeout=2)
 
     return True

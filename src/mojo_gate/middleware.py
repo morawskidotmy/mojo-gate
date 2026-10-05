@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import urllib.parse
@@ -64,7 +65,8 @@ class MojoGateMiddleware:
         headers = dict(scope.get("headers", []))
         expected_token = os.environ.get("MOJO_GATE_INTERNAL_TOKEN", "").strip().encode("ascii")
         if expected_token:
-            return headers.get(b"x-mojo-gate-token") == expected_token
+            token = headers.get(b"x-mojo-gate-token", b"")
+            return hmac.compare_digest(token, expected_token)
         # Fallback if no token configured: disallow forwarded headers
         return b"x-forwarded-for" not in headers
 
