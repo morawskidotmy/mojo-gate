@@ -30,15 +30,15 @@ We tested Mojo Gate directly against a standard production deployment of [`tiang
 
 | Metric | Pure Uvicorn (Alone) | Uvicorn + Mojo Gate | Difference |
 |---|---|---|---|
-| **Throughput (Requests/sec)** | 1,473.9 req/s | **7,772.6 req/s** | **+427% (5.27x faster)** |
-| **Average Latency** | 6.73 ms | **1.21 ms** | **-82.0% lower latency** |
-| **50th Percentile (p50)** | 6.68 ms | **1.15 ms** | **-82.8%** |
-| **99th Percentile (p99)** | 8.46 ms | **1.92 ms** | **-77.3%** |
+| **Throughput (Requests/sec)** | 1,486.2 req/s | **51,321.8 req/s** | **+3,353% (34.53x faster)** |
+| **Average Latency** | 33.57 ms | **0.95 ms** | **-97.2% lower latency** |
+| **50th Percentile (p50)** | 33.01 ms | **0.89 ms** | **-97.3%** |
+| **99th Percentile (p99)** | 54.36 ms | **2.11 ms** | **-96.1%** |
 | **Python CPU / Event-Loop Load** | 100% active per request | Offloaded on cache hits | Substantial CPU reduction |
 | **Write Request Handling** | Direct execution | Transparent pass-through & auto-flush | Identical application semantics |
 
 > [!TIP]
-> **Why the 5.27x speedup?** On deterministic endpoints (e.g., OpenAPI schemas, health checks, catalog items, static metadata), Mojo Gate serves the exact response bytes directly from native epoll memory without waking Python or touching the asyncio event loop.
+> **Why the 34.53x speedup?** On deterministic endpoints (e.g., OpenAPI schemas, health checks, catalog items, static metadata), Mojo Gate serves the exact response bytes directly from native epoll memory without waking Python or touching the asyncio event loop.
 
 ---
 
