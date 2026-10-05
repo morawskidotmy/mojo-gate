@@ -502,14 +502,17 @@ def parse_request(buf: List[UInt8], internal_token: String = "") -> Request:
     for b in r.target.as_bytes():
         if b > 126 or b < 33:
             r.non_ascii = True
-    var target_bytes = percent_decode_bytes(r.target)
-    var target_str = latin1(target_bytes, 0, len(target_bytes))
-    var q = target_str.find("?")
+    var q = r.target.find("?")
+    var raw_p: String
+    var raw_q = String("")
     if q >= 0:
-        r.raw_path = normalize_path(String(target_str[byte=0:q]))
-        r.raw_query = String(target_str[byte=q + 1:target_str.byte_length()])
+        raw_p = String(r.target[byte=0:q])
+        raw_q = String(r.target[byte=q + 1:r.target.byte_length()])
     else:
-        r.raw_path = normalize_path(target_str)
+        raw_p = r.target
+    var p_bytes = percent_decode_bytes(raw_p)
+    r.raw_path = normalize_path(latin1(p_bytes, 0, len(p_bytes)))
+    r.raw_query = raw_q
     var pos = i + 2
     var first_xff = True
     var have_ae = False
@@ -699,6 +702,7 @@ def upstream_request(r: Request, buf: List[UInt8], client_ip: String) -> List[UI
     append_str(out, r.method + " " + r.target + " " + r.version + "\r\n")
     var forwarded_written = False
     var proto_written = False
+    var is_loopback = (client_ip == "127.0.0.1" or client_ip == "::1")
     for i in range(len(r.lines)):
         var l = r.lines[i]
         var colon = l.find(":")
@@ -712,6 +716,8 @@ def upstream_request(r: Request, buf: List[UInt8], client_ip: String) -> List[UI
                 forwarded_written = True
                 continue
             if name == "x-forwarded-proto":
+                if not is_loopback:
+                    continue  # untrusted client cannot spoof scheme
                 proto_written = True
         # header lines are latin-1 decoded; re-encode byte-for-byte
         for cp in l.codepoints():
@@ -721,7 +727,10 @@ def upstream_request(r: Request, buf: List[UInt8], client_ip: String) -> List[UI
         append_str(out, "X-Forwarded-For: " + client_ip + "\r\n")
     if not proto_written:
         append_str(out, "X-Forwarded-Proto: http\r\n")
-    append_str(out, "Connection: close\r\n\r\n")
+    if r.upgrade:
+        append_str(out, "Connection: Upgrade\r\n\r\n")
+    else:
+        append_str(out, "Connection: close\r\n\r\n")
     for i in range(r.head_len, r.head_len + r.body_len):
         out.append(buf[i])
     return out^
@@ -1348,13 +1357,18 @@ struct Proxy:
         if ufd < 0:
             self.bad_gateway(client)
             return
-        if r.upgrade:
-            # For HTTP Upgrade (e.g. WebSocket), wait for upstream to answer 101 Switching Protocols
-            self.conns[client].state = C_WAITING
-        else:
-            self.conns[client].state = C_TUNNEL
         self.conns[ufd].out = upstream_request(r, inbuf, self.conns[client].client_ip)
-        self.conns[client].inbuf = List[UInt8]()
+        if not r.upgrade:
+            self.conns[client].state = C_TUNNEL
+            for k in range(r.head_len, len(inbuf)):
+                self.conns[ufd].out.append(inbuf[k])
+            self.conns[client].inbuf = List[UInt8]()
+        else:
+            self.conns[client].state = C_WAITING
+            if len(inbuf) > r.head_len:
+                self.conns[client].inbuf = List[UInt8](inbuf[r.head_len:len(inbuf)])
+            else:
+                self.conns[client].inbuf = List[UInt8]()
 
     # -- event handlers ------------------------------------------------------------
 
