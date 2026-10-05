@@ -42,52 +42,18 @@ We tested Mojo Gate directly against a standard production deployment of [`tiang
 
 ---
 
-## Ease of Integration
-
-Adopting a native front proxy typically requires maintaining separate Nginx/HAProxy configuration files, manual SSL termination stitching, Redis caching decorators, and complex cache invalidation hooks.
-
-Mojo Gate requires **zero changes** to your application routes, models, or schemas:
-
-### Traditional Caching vs. Mojo Gate
-
-| Capability | Traditional Reverse Proxy (Nginx/Redis) | Mojo Gate Front Proxy |
-|---|---|---|
-| **Setup & Dependencies** | Requires external daemons (Nginx/Varnish/Redis) | Single Python package (`pip install mojo-gate`) |
-| **Route Configuration** | Complex `nginx.conf` proxy / cache keys | Automatic (respects safe methods, headers, and paths) |
-| **Cache Invalidation** | Manual cache keys & Redis invalidation hooks | **Automatic** on any write (`POST`/`PUT`/`DELETE`/`PATCH`) |
-| **Code Changes Required** | Custom decorators or middleware across routes | **Zero route changes** — drop-in replacement runner |
-| **Fallback on Failure** | Hard 502 Bad Gateway if proxy container drops | Automatically falls back to serving Uvicorn directly |
-
-### Integrating with `full-stack-fastapi-template`
-
-#### Option 1: Command Line (Zero code changes)
-
-Run the backend via `mojo-gate` CLI instead of `uvicorn`:
+## Installation
 
 ```bash
-# Before:
-uvicorn app.main:app --host 0.0.0.0 --port 8000
+# uv
+uv add git+https://github.com/morawskidotmy/mojo-gate.git
 
-# With Mojo Gate:
-mojo-gate app.main:app --host 0.0.0.0 --port 8000 --upstream-port 8003
+# pip
+pip install git+https://github.com/morawskidotmy/mojo-gate.git
 ```
 
-#### Option 2: Python Runner
-
-```python
-# In your startup script:
-import mojo_gate
-
-if __name__ == "__main__":
-    mojo_gate.serve(
-        "app.main:app",
-        host="0.0.0.0",
-        port=8000,
-        upstream_port=8003,
-        cache_ttl=60,
-        rate_rules=[("/api/v1", 200, 60)],
-    )
-```
+> [!NOTE]
+> Compiling the native proxy binary requires the [Mojo SDK](https://docs.modular.com/mojo/) (detected automatically via `$MOJO`, PATH, `~/.mojo-venv`, or `~/.pixi`). If the compiler is not present, `mojo-gate` gracefully falls back to serving Uvicorn directly.
 
 ---
 
@@ -115,20 +81,6 @@ Client Requests
 
 > [!NOTE]
 > Mojo Gate sits in front of Uvicorn on loopback (`127.0.0.1`). If the Mojo compiler or native binary is unavailable, the supervisor automatically falls back to serving Uvicorn alone without breaking application startup.
-
----
-
-## Installation
-
-Install the Python module:
-
-```bash
-cd mojo-gate
-pip install .
-```
-
-> [!IMPORTANT]
-> Compiling the native proxy binary requires the [Mojo SDK](https://docs.modular.com/mojo/) (installed via Modular, `pixi`, or virtualenv). Mojo Gate automatically detects the toolchain via `$MOJO`, system PATH, `~/.mojo-venv`, or `~/.pixi`.
 
 ---
 

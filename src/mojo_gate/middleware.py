@@ -9,9 +9,11 @@ import urllib.request
 from collections.abc import Callable, Coroutine
 from typing import Any
 
-from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
-from starlette.types import ASGIApp, Receive, Scope, Send
+# Pure ASGI types (avoids hard dependency on starlette)
+Scope = dict[str, Any]
+Receive = Callable[[], Coroutine[Any, Any, dict[str, Any]]]
+Send = Callable[[dict[str, Any]], Coroutine[Any, Any, None]]
+ASGIApp = Callable[[Scope, Receive, Send], Coroutine[Any, Any, None]]
 
 
 def is_front_proxy_active() -> bool:
@@ -52,41 +54,70 @@ class MojoGateMiddleware:
         self.analytics_endpoint = analytics_endpoint
         self.on_analytics = on_analytics
 
-    def _is_loopback_proxy_call(self, request: Request) -> bool:
-        """Verify the request is a direct loopback call from Mojo Gate."""
-        return (
-            is_front_proxy_active()
-            and request.client is not None
-            and request.client.host in ("127.0.0.1", "::1", "localhost")
-            and "x-forwarded-for" not in request.headers
-        )
+    def _is_loopback_proxy_call(self, scope: Scope) -> bool:
+        """Verify the request is a direct authenticated loopback call from Mojo Gate."""
+        if not is_front_proxy_active():
+            return False
+        client = scope.get("client")
+        if not client or client[0] not in ("127.0.0.1", "::1", "localhost"):
+            return False
+        headers = dict(scope.get("headers", []))
+        expected_token = os.environ.get("MOJO_GATE_INTERNAL_TOKEN", "").strip().encode("ascii")
+        if expected_token:
+            return headers.get(b"x-mojo-gate-token") == expected_token
+        # Fallback if no token configured: disallow forwarded headers
+        return b"x-forwarded-for" not in headers
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http":
+        if scope.get("type") != "http":
             await self.app(scope, receive, send)
             return
 
-        request = Request(scope, receive)
-        path = request.url.path
+        path = scope.get("path", "")
+        method = scope.get("method", "GET")
 
         # Handle batched cache-hit analytics from front proxy
         if (
             path == self.analytics_endpoint
-            and request.method == "POST"
-            and self._is_loopback_proxy_call(request)
+            and method == "POST"
+            and self._is_loopback_proxy_call(scope)
         ):
             try:
-                body = await request.body()
-                data = json.loads(body)
+                body_parts: list[bytes] = []
+                while True:
+                    message = await receive()
+                    body_parts.append(message.get("body", b""))
+                    if not message.get("more_body", False):
+                        break
+                body = b"".join(body_parts)
+                data = json.loads(body.decode("utf-8")) if body else []
                 if self.on_analytics and isinstance(data, list):
-                    # Call synchronous or asynchronous handler
                     res = self.on_analytics(data)
                     if isinstance(res, Coroutine):
                         await res
-                response = Response(status_code=204)
+                await send({
+                    "type": "http.response.start",
+                    "status": 204,
+                    "headers": [(b"content-length", b"0")],
+                })
+                await send({
+                    "type": "http.response.body",
+                    "body": b"",
+                })
             except Exception:
-                response = JSONResponse({"detail": "invalid analytics payload"}, status_code=400)
-            await response(scope, receive, send)
+                err_body = b'{"detail":"invalid analytics payload"}'
+                await send({
+                    "type": "http.response.start",
+                    "status": 400,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"content-length", str(len(err_body)).encode("ascii")),
+                    ],
+                })
+                await send({
+                    "type": "http.response.body",
+                    "body": err_body,
+                })
             return
 
         # Add flag to request state

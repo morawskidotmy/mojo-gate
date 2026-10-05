@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import os
+import secrets
 import signal
 import socket
 import subprocess
@@ -108,9 +109,11 @@ def serve(
         )
 
     # Inform the app it sits behind the Mojo front proxy
+    internal_token = secrets.token_hex(32)
     os.environ["MOJO_GATE_FRONT_PROXY"] = "1"
     os.environ["MOJO_GATE_PORT"] = str(port)
     os.environ["MOJO_GATE_UPSTREAM_PORT"] = str(up_port)
+    os.environ["MOJO_GATE_INTERNAL_TOKEN"] = internal_token
 
     # Build proxy command line arguments
     cmd = [
@@ -129,6 +132,8 @@ def serve(
         str(cache_max_bytes),
         "--purge-endpoint",
         purge_endpoint,
+        "--internal-token",
+        internal_token,
     ]
     if not rate_limit:
         cmd.append("--no-rate-limit")

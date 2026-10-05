@@ -42,7 +42,9 @@ comptime EPOLL_CTL_DEL = 2
 comptime EPOLL_CTL_MOD = 3
 
 comptime MAX_HEADER_BYTES = 65536
-comptime MAX_TARGET_BYTES = 2048
+comptime MAX_TARGET_BYTES = 4096
+comptime MAX_INBUF_BYTES = 16777216  # 16 MB max buffered client bytes
+comptime MAX_BUCKETS = 65536
 
 # Client connection states
 comptime C_IDLE = 0      # reading / parsing requests
@@ -119,6 +121,7 @@ struct Conn(Copyable, Movable):
     var cl: Int              # content-length of the response (-1 unknown)
     var chunked: Bool
     var body_seen: Int
+    var client_ip: String
 
     def __init__(out self):
         self.active = False
@@ -139,6 +142,7 @@ struct Conn(Copyable, Movable):
         self.cl = -1
         self.chunked = False
         self.body_seen = 0
+        self.client_ip = String("127.0.0.1")
 
 
 struct Entry(Copyable, Movable):
@@ -161,6 +165,7 @@ struct Entry(Copyable, Movable):
 
 struct Request(Copyable, Movable):
     var ok: Bool
+    var bad_status: Int       # 400, 413, 501 if not ok
     var method: String
     var target: String        # raw request-target
     var raw_path: String
@@ -183,10 +188,12 @@ struct Request(Copyable, Movable):
     var xfh: String
     var uncacheable_hdr: Bool  # Cookie / Authorization / Range / If-* present
     var non_ascii: Bool
+    var token_matched: Bool    # X-Mojo-Gate-Token matched internal secret
     var lines: List[String]    # header lines (raw), to rebuild the upstream request
 
     def __init__(out self):
         self.ok = False
+        self.bad_status = 400
         self.method = String("")
         self.target = String("")
         self.raw_path = String("")
@@ -209,10 +216,42 @@ struct Request(Copyable, Movable):
         self.xfh = String("")
         self.uncacheable_hdr = False
         self.non_ascii = False
+        self.token_matched = False
         self.lines = List[String]()
 
 
 # ─── small helpers ─────────────────────────────────────────────────────────
+
+
+def format_ipv4(addr: UInt32) -> String:
+    var a = Int(addr & 0xFF)
+    var b = Int((addr >> 8) & 0xFF)
+    var c = Int((addr >> 16) & 0xFF)
+    var d = Int((addr >> 24) & 0xFF)
+    return String(a) + "." + String(b) + "." + String(c) + "." + String(d)
+
+
+def normalize_path(p: String) -> String:
+    """RFC 3986 path normalization removing dot segments (. / ..) and multiple slashes."""
+    if p.byte_length() == 0:
+        return String("/")
+    var parts = p.split("/")
+    var stack = List[String]()
+    for i in range(len(parts)):
+        var seg = String(parts[i])
+        if seg.byte_length() == 0 or seg == ".":
+            continue
+        if seg == "..":
+            if len(stack) > 0:
+                _ = stack.pop()
+        else:
+            stack.append(seg)
+    var out = String("")
+    for i in range(len(stack)):
+        out += "/" + stack[i]
+    if out.byte_length() == 0:
+        return String("/")
+    return out
 
 
 def errno() -> Int:
@@ -399,7 +438,7 @@ def http_date() -> String:
 # ─── request parsing ───────────────────────────────────────────────────────
 
 
-def parse_request(buf: List[UInt8]) -> Request:
+def parse_request(buf: List[UInt8], internal_token: String = "") -> Request:
     """Parse the request head at the start of `buf` (caller checked CRLFCRLF)."""
     var r = Request()
     var end = find_crlfcrlf(buf, 0)
@@ -413,6 +452,8 @@ def parse_request(buf: List[UInt8]) -> Request:
     var line = latin1(buf, 0, i)
     var parts = line.split(" ")
     if len(parts) != 3:
+        r.ok = False
+        r.bad_status = 400
         return r^
     r.method = String(parts[0])
     r.target = String(parts[1])
@@ -422,13 +463,14 @@ def parse_request(buf: List[UInt8]) -> Request:
             r.non_ascii = True
     var q = r.target.find("?")
     if q >= 0:
-        r.raw_path = String(r.target[byte=0:q])
+        r.raw_path = normalize_path(String(r.target[byte=0:q]))
         r.raw_query = String(r.target[byte=q + 1:r.target.byte_length()])
     else:
-        r.raw_path = r.target
+        r.raw_path = normalize_path(r.target)
     var pos = i + 2
     var first_xff = True
     var have_ae = False
+    var have_cl = False
     var body_len = 0
     while pos + 1 < end:
         var e = pos
@@ -436,62 +478,104 @@ def parse_request(buf: List[UInt8]) -> Request:
             e += 1
         if e == pos:
             break
+        # Reject control characters (CRLF injection / smuggling)
         for k in range(pos, e):
-            if buf[k] > 126:
+            var b = Int(buf[k])
+            if b < 32 and b != 9:
+                r.ok = False
+                r.bad_status = 400
+                return r^
+            if b > 126:
                 r.non_ascii = True
         var hl = latin1(buf, pos, e)
-        r.lines.append(hl)
         var colon = hl.find(":")
-        if colon > 0:
-            var name = lower_ascii(String(hl[byte=0:colon]))
-            var value = strip_ws(String(hl[byte=colon + 1:hl.byte_length()]))
-            if name == "content-length":
-                var v = parse_int(value)
-                if v < 0:
-                    r.chunked = True  # malformed: let upstream deal with it via tunnel
-                else:
-                    body_len = v
-            elif name == "transfer-encoding":
+        if colon <= 0 or (colon > 0 and (hl.as_bytes()[colon - 1] == 32 or hl.as_bytes()[colon - 1] == 9)):
+            # Disallow header names with whitespace before colon (RFC 7230 §3.2.4)
+            r.ok = False
+            r.bad_status = 400
+            return r^
+        r.lines.append(hl)
+        var name = lower_ascii(String(hl[byte=0:colon]))
+        var value = strip_ws(String(hl[byte=colon + 1:hl.byte_length()]))
+        if name == "content-length":
+            if have_cl:
+                # Conflicting duplicate Content-Length headers
+                r.ok = False
+                r.bad_status = 400
+                return r^
+            if r.chunked:
+                # Both Transfer-Encoding and Content-Length present (smuggling attack)
+                r.ok = False
+                r.bad_status = 400
+                return r^
+            var v = parse_int(value)
+            if v < 0:
+                r.ok = False
+                r.bad_status = 400
+                return r^
+            if v > MAX_INBUF_BYTES:
+                r.ok = False
+                r.bad_status = 413
+                return r^
+            body_len = v
+            have_cl = True
+        elif name == "transfer-encoding":
+            if have_cl:
+                # Both Transfer-Encoding and Content-Length present (smuggling attack)
+                r.ok = False
+                r.bad_status = 400
+                return r^
+            var lv = lower_ascii(value)
+            if lv.find("chunked") >= 0:
                 r.chunked = True
-            elif name == "upgrade":
+            else:
+                r.ok = False
+                r.bad_status = 501
+                return r^
+        elif name == "upgrade":
+            r.upgrade = True
+        elif name == "expect":
+            r.expect = True
+        elif name == "connection":
+            var lv = lower_ascii(value)
+            if lv.find("close") >= 0:
+                r.conn_close = True
+            if lv.find("keep-alive") >= 0:
+                r.conn_keep = True
+            if lv.find("upgrade") >= 0:
                 r.upgrade = True
-            elif name == "expect":
-                r.expect = True
-            elif name == "connection":
-                var lv = lower_ascii(value)
-                if lv.find("close") >= 0:
-                    r.conn_close = True
-                if lv.find("keep-alive") >= 0:
-                    r.conn_keep = True
-                if lv.find("upgrade") >= 0:
-                    r.upgrade = True
-            elif name == "x-forwarded-for":
-                if first_xff:
-                    r.xff = value
-                    first_xff = False
-                else:
-                    r.xff += ", " + value
-                r.has_xff = True
-            elif name == "user-agent":
-                if r.user_agent.byte_length() == 0:
-                    r.user_agent = value
-            elif name == "accept-encoding":
-                if not have_ae:
-                    r.accept_gzip = value.find("gzip") >= 0
-                    have_ae = True
-            elif name == "origin":
-                r.has_origin = True
-            elif name == "host":
-                r.host = value
-            elif name == "x-forwarded-proto":
-                r.xfp = value
-            elif name == "x-forwarded-host":
-                r.xfh = value
-            elif (name == "cookie" or name == "authorization" or name == "range"
-                  or name == "if-none-match" or name == "if-modified-since"
-                  or name == "if-range" or name == "if-match"
-                  or name == "if-unmodified-since"):
-                r.uncacheable_hdr = True
+        elif name == "x-forwarded-for":
+            if first_xff:
+                r.xff = value
+                first_xff = False
+            else:
+                r.xff += ", " + value
+            r.has_xff = True
+        elif name == "user-agent":
+            if r.user_agent.byte_length() == 0:
+                r.user_agent = value
+        elif name == "accept-encoding":
+            if not have_ae:
+                r.accept_gzip = value.find("gzip") >= 0
+                have_ae = True
+        elif name == "origin":
+            r.has_origin = True
+        elif name == "host":
+            r.host = value
+        elif name == "x-forwarded-proto":
+            r.xfp = value
+        elif name == "x-forwarded-host":
+            r.xfh = value
+        elif name == "x-mojo-gate-token":
+            if internal_token.byte_length() > 0 and value == internal_token:
+                r.token_matched = True
+        elif (name == "cookie" or name == "authorization" or name == "range"
+              or name == "proxy-authorization" or name == "x-api-key"
+              or name == "api-key" or name == "x-auth-token" or name == "x-session-id"
+              or name == "if-none-match" or name == "if-modified-since"
+              or name == "if-range" or name == "if-match"
+              or name == "if-unmodified-since"):
+            r.uncacheable_hdr = True
         pos = e + 2
     r.body_len = body_len
     r.ok = True
@@ -539,10 +623,12 @@ def cache_key(r: Request) -> String:
             + " p" + r.xfp + " x" + r.xfh)
 
 
-def upstream_request(r: Request, buf: List[UInt8]) -> List[UInt8]:
-    """The request as sent to upstream: same head with `Connection: close`."""
+def upstream_request(r: Request, buf: List[UInt8], client_ip: String) -> List[UInt8]:
+    """The request as sent to upstream: same head with `Connection: close` and client IP."""
     var out = List[UInt8]()
     append_str(out, r.method + " " + r.target + " " + r.version + "\r\n")
+    var forwarded_written = False
+    var proto_written = False
     for i in range(len(r.lines)):
         var l = r.lines[i]
         var colon = l.find(":")
@@ -550,10 +636,20 @@ def upstream_request(r: Request, buf: List[UInt8]) -> List[UInt8]:
             var name = lower_ascii(String(l[byte=0:colon]))
             if name == "connection" or name == "keep-alive" or name == "proxy-connection":
                 continue
+            if name == "x-forwarded-for":
+                append_str(out, "X-Forwarded-For: " + r.xff + ", " + client_ip + "\r\n")
+                forwarded_written = True
+                continue
+            if name == "x-forwarded-proto":
+                proto_written = True
         # header lines are latin-1 decoded; re-encode byte-for-byte
         for cp in l.codepoints():
             out.append(UInt8(Int(cp)))
         append_str(out, "\r\n")
+    if not forwarded_written and client_ip.byte_length() > 0:
+        append_str(out, "X-Forwarded-For: " + client_ip + "\r\n")
+    if not proto_written:
+        append_str(out, "X-Forwarded-Proto: http\r\n")
     append_str(out, "Connection: close\r\n\r\n")
     for i in range(r.head_len, r.head_len + r.body_len):
         out.append(buf[i])
@@ -577,6 +673,7 @@ struct Proxy:
     var no_cache_prefixes: List[String]
     var analytics_endpoint: String
     var purge_endpoint: String
+    var internal_token: String
     var conns: List[Conn]
     var cache: Dict[String, Entry]
     var cache_bytes: Int
@@ -588,7 +685,8 @@ struct Proxy:
                  cache_ttl_s: Int, cache_max_bytes: Int, entry_max_bytes: Int,
                  rate_limit: Bool, var rate_rules: List[RateRule],
                  rate_limit_msg: String, var no_cache_prefixes: List[String],
-                 analytics_endpoint: String, purge_endpoint: String):
+                 analytics_endpoint: String, purge_endpoint: String,
+                 internal_token: String):
         self.epfd = 0
         self.listen_fd = 0
         self.upstream_host_ip = upstream_host_ip
@@ -602,6 +700,7 @@ struct Proxy:
         self.no_cache_prefixes = no_cache_prefixes^
         self.analytics_endpoint = analytics_endpoint
         self.purge_endpoint = purge_endpoint
+        self.internal_token = internal_token
         self.conns = List[Conn]()
         self.cache = Dict[String, Entry]()
         self.cache_bytes = 0
@@ -697,9 +796,39 @@ struct Proxy:
         return ufd
 
     def bad_gateway(mut self, client: Int):
-        var body = String("Bad Gateway")
+        var body = String('{"detail":"Bad Gateway"}')
         var out = List[UInt8]()
-        append_str(out, "HTTP/1.1 502 Bad Gateway\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: "
+        append_str(out, "HTTP/1.1 502 Bad Gateway\r\nserver: mojo-gate\r\ncontent-type: application/json\r\ncontent-length: "
+                   + String(body.byte_length()) + "\r\nconnection: close\r\n\r\n" + body)
+        self.conns[client].close_after = True
+        self.conns[client].state = C_IDLE
+        self.send_bytes(client, out)
+
+    def bad_request(mut self, client: Int, msg: String = "Bad Request"):
+        var body = String('{"detail":"') + msg + String('"}')
+        var out = List[UInt8]()
+        append_str(out, "HTTP/1.1 400 Bad Request\r\ndate: " + http_date()
+                   + "\r\nserver: mojo-gate\r\ncontent-type: application/json\r\ncontent-length: "
+                   + String(body.byte_length()) + "\r\nconnection: close\r\n\r\n" + body)
+        self.conns[client].close_after = True
+        self.conns[client].state = C_IDLE
+        self.send_bytes(client, out)
+
+    def forbidden(mut self, client: Int, msg: String = "Forbidden"):
+        var body = String('{"detail":"') + msg + String('"}')
+        var out = List[UInt8]()
+        append_str(out, "HTTP/1.1 403 Forbidden\r\ndate: " + http_date()
+                   + "\r\nserver: mojo-gate\r\ncontent-type: application/json\r\ncontent-length: "
+                   + String(body.byte_length()) + "\r\nconnection: close\r\n\r\n" + body)
+        self.conns[client].close_after = True
+        self.conns[client].state = C_IDLE
+        self.send_bytes(client, out)
+
+    def payload_too_large(mut self, client: Int):
+        var body = String('{"detail":"Payload Too Large"}')
+        var out = List[UInt8]()
+        append_str(out, "HTTP/1.1 413 Payload Too Large\r\ndate: " + http_date()
+                   + "\r\nserver: mojo-gate\r\ncontent-type: application/json\r\ncontent-length: "
                    + String(body.byte_length()) + "\r\nconnection: close\r\n\r\n" + body)
         self.conns[client].close_after = True
         self.conns[client].state = C_IDLE
@@ -759,7 +888,13 @@ struct Proxy:
                 set_cookie = True
             elif name == "cache-control":
                 var lv = lower_ascii(value)
-                if lv.find("no-store") >= 0 or lv.find("private") >= 0:
+                if (lv.find("no-store") >= 0 or lv.find("private") >= 0
+                    or lv.find("no-cache") >= 0 or lv.find("max-age=0") >= 0
+                    or lv.find("s-maxage=0") >= 0):
+                    no_store = True
+            elif name == "vary":
+                var lv = lower_ascii(value)
+                if lv.find("*") >= 0:
                     no_store = True
         var no_body = self.conns[ufd].head_req or status == 204 or status == 304 or (status >= 100 and status < 200)
         var delimited = no_body or cl >= 0 or chunked
@@ -956,6 +1091,10 @@ struct Proxy:
         var key = ip + "|" + prefix
         var now_ms = Int(monotonic() // 1_000_000)
         if key not in self.buckets:
+            if len(self.buckets) >= MAX_BUCKETS:
+                self.prune_buckets()
+                if len(self.buckets) >= MAX_BUCKETS:
+                    return 0  # fail-open on bucket table overflow to avoid OOM
             self.buckets[key] = List[Int]()
         try:
             var b = self.buckets[key].copy()
@@ -1019,11 +1158,21 @@ struct Proxy:
             var hend = find_crlfcrlf(inbuf, 0)
             if hend < 0:
                 if len(inbuf) > MAX_HEADER_BYTES:
-                    self.close_fd(client)
+                    self.bad_request(client, "Header size exceeds limit")
                 return
-            var r = parse_request(inbuf)
+            var r = parse_request(inbuf, self.internal_token)
             if not r.ok:
-                self.close_fd(client)
+                if r.bad_status == 413:
+                    self.payload_too_large(client)
+                elif r.bad_status == 501:
+                    var body = String('{"detail":"Not Implemented"}')
+                    var out = List[UInt8]()
+                    append_str(out, "HTTP/1.1 501 Not Implemented\r\ncontent-length: "
+                               + String(body.byte_length()) + "\r\nconnection: close\r\n\r\n" + body)
+                    self.conns[client].close_after = True
+                    self.send_bytes(client, out)
+                else:
+                    self.bad_request(client, "Malformed request or invalid headers")
                 return
             if r.chunked or r.upgrade or r.expect or r.method == "CONNECT":
                 self.start_tunnel(client)
@@ -1035,8 +1184,17 @@ struct Proxy:
             var keep = r.version == "HTTP/1.1" and not r.conn_close
             self.conns[client].keep_alive = keep
 
-            # Check cache purge endpoint
+            # Block external access to internal analytics endpoint
+            if self.analytics_endpoint.byte_length() > 0 and r.raw_path == self.analytics_endpoint:
+                self.forbidden(client, "Direct access to internal analytics is forbidden")
+                return
+
+            # Check cache purge endpoint (allow only from loopback or internal token)
             if self.purge_endpoint.byte_length() > 0 and r.raw_path == self.purge_endpoint and (r.method == "POST" or r.method == "DELETE" or r.method == "PURGE"):
+                var peer_ip = self.conns[client].client_ip
+                if peer_ip != "127.0.0.1" and peer_ip != "::1" and not r.token_matched:
+                    self.forbidden(client, "Cache purge allowed only from loopback")
+                    return
                 self.handle_purge(client, keep)
                 if not keep:
                     self.conns[client].close_after = True
@@ -1044,7 +1202,10 @@ struct Proxy:
                 return
 
             var path = percent_decode_bytes(r.raw_path)
-            var ip = client_ip(r)
+            # Determine client IP: only trust X-Forwarded-For if request came from trusted loopback
+            var ip = self.conns[client].client_ip
+            if r.has_xff and (ip == "127.0.0.1" or ip == "::1"):
+                ip = client_ip(r)
 
             var verdict = self.rate_check(path, ip)
             if verdict > 0:
@@ -1099,7 +1260,7 @@ struct Proxy:
         self.conns[client].state = C_WAITING
         self.conns[ufd].cache_key = key
         self.conns[ufd].head_req = r.method == "HEAD"
-        self.conns[ufd].out = upstream_request(r, inbuf)
+        self.conns[ufd].out = upstream_request(r, inbuf, self.conns[client].client_ip)
 
     def start_tunnel(mut self, client: Int):
         var ufd = self.connect_upstream(client)
@@ -1118,6 +1279,10 @@ struct Proxy:
             var peer = self.conns[fd].peer
             if peer >= 0:
                 self.send_bytes(peer, data)
+            return
+        if len(self.conns[fd].inbuf) + n > MAX_INBUF_BYTES:
+            self.payload_too_large(fd)
+            self.close_fd(fd)
             return
         self.conns[fd].inbuf.extend(data^)
         if self.conns[fd].state == C_IDLE:
