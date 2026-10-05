@@ -1,6 +1,10 @@
-# Mojo Gate
+<div align="center">
+
+# ⛩️🔥 Mojo Gate
 
 High-performance reverse proxy and caching front proxy written in **Mojo**, designed to run directly in front of **Uvicorn** and Python ASGI applications (FastAPI, Starlette, Litestar).
+
+</div>
 
 Mojo Gate offloads connection multiplexing, HTTP caching, and sliding-window rate limiting to native code using the Linux `epoll` system call, freeing Python worker event loops to focus strictly on dynamic application logic.
 
