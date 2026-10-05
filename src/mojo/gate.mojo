@@ -301,22 +301,48 @@ def find_crlfcrlf(buf: List[UInt8], start: Int) -> Int:
 
 
 def latin1(buf: List[UInt8], start: Int, end: Int) -> String:
-    """Bytes -> String, one code point per byte."""
-    var s = String("")
-    for i in range(start, end):
-        s += chr(Int(buf[i]))
-    return s
+    """Bytes -> String, single-allocation slice conversion."""
+    if end <= start:
+        return String("")
+    return String(unsafe_from_utf8=buf[start:end])
 
 
 def lower_ascii(s: String) -> String:
-    var out = String("")
-    for b in s.as_bytes():
-        var c = Int(b)
-        if c >= 65 and c <= 90:
-            out += chr(c + 32)
+    """ASCII lowercasing: 0 allocations if already lower, 1 allocation if upper."""
+    var bytes = s.as_bytes()
+    var has_upper = False
+    for i in range(len(bytes)):
+        var b = Int(bytes[i])
+        if b >= 65 and b <= 90:
+            has_upper = True
+            break
+    if not has_upper:
+        return s
+    var tmp = List[UInt8](capacity=len(bytes))
+    for i in range(len(bytes)):
+        var b = Int(bytes[i])
+        if b >= 65 and b <= 90:
+            tmp.append(UInt8(b + 32))
         else:
-            out += chr(c)
-    return out
+            tmp.append(UInt8(b))
+    return String(unsafe_from_utf8=tmp[0:len(tmp)])
+
+
+def bytes_equal_ci(buf: List[UInt8], start: Int, end: Int, target: String) -> Bool:
+    """Zero-allocation case-insensitive ASCII comparison."""
+    var t = target.as_bytes()
+    if end - start != len(t):
+        return False
+    for i in range(len(t)):
+        var b = Int(buf[start + i])
+        var tb = Int(t[i])
+        if b >= 65 and b <= 90:
+            b += 32
+        if tb >= 65 and tb <= 90:
+            tb += 32
+        if b != tb:
+            return False
+    return True
 
 
 def strip_ws(s: String) -> String:
@@ -689,15 +715,37 @@ def parse_host(value: String) -> String:
 
 
 def cache_key(r: Request, is_loopback: Bool) -> String:
-    var base = r.method + "\x1f" + r.raw_path
+    var total_len = r.method.byte_length() + 1 + r.raw_path.byte_length() + 3 + 3 + 2 + r.host.byte_length()
     if r.raw_query.byte_length() > 0:
-        base += "?" + r.raw_query
-    base += "\x1fg" + ("1" if r.accept_gzip else "0")
-    base += "\x1fo" + ("1" if r.has_origin else "0")
-    base += "\x1fh" + r.host
+        total_len += 1 + r.raw_query.byte_length()
     if is_loopback:
-        base += "\x1fp" + r.xfp + "\x1fx" + r.xfh
-    return base
+        total_len += 2 + r.xfp.byte_length() + 2 + r.xfh.byte_length()
+
+    var k = List[UInt8](capacity=total_len)
+    append_str(k, r.method)
+    k.append(31)  # \x1f
+    append_str(k, r.raw_path)
+    if r.raw_query.byte_length() > 0:
+        k.append(63)  # '?'
+        append_str(k, r.raw_query)
+    k.append(31)
+    k.append(103)  # 'g'
+    k.append(UInt8(49) if r.accept_gzip else UInt8(48))
+    k.append(31)
+    k.append(111)  # 'o'
+    k.append(UInt8(49) if r.has_origin else UInt8(48))
+    k.append(31)
+    k.append(104)  # 'h'
+    append_str(k, r.host)
+    if is_loopback:
+        k.append(31)
+        k.append(112)  # 'p'
+        append_str(k, r.xfp)
+        k.append(31)
+        k.append(120)  # 'x'
+        append_str(k, r.xfh)
+
+    return String(unsafe_from_utf8=k[0:len(k)])
 
 
 def upstream_request(r: Request, buf: List[UInt8], client_ip: String) -> List[UInt8]:
@@ -925,7 +973,7 @@ struct Proxy:
     def bad_request(mut self, client: Int, msg: String = "Bad Request"):
         var body = String('{"detail":"') + msg + String('"}')
         var out = List[UInt8]()
-        append_str(out, "HTTP/1.1 400 Bad Request\r\ndate: " + http_date()
+        append_str(out, "HTTP/1.1 400 Bad Request\r\ndate: " + self.current_date()
                    + "\r\nserver: mojo-gate\r\ncontent-type: application/json\r\ncontent-length: "
                    + String(body.byte_length()) + "\r\nconnection: close\r\n\r\n" + body)
         self.conns[client].close_after = True
@@ -935,7 +983,7 @@ struct Proxy:
     def forbidden(mut self, client: Int, msg: String = "Forbidden"):
         var body = String('{"detail":"') + msg + String('"}')
         var out = List[UInt8]()
-        append_str(out, "HTTP/1.1 403 Forbidden\r\ndate: " + http_date()
+        append_str(out, "HTTP/1.1 403 Forbidden\r\ndate: " + self.current_date()
                    + "\r\nserver: mojo-gate\r\ncontent-type: application/json\r\ncontent-length: "
                    + String(body.byte_length()) + "\r\nconnection: close\r\n\r\n" + body)
         self.conns[client].close_after = True
@@ -945,7 +993,7 @@ struct Proxy:
     def payload_too_large(mut self, client: Int):
         var body = String('{"detail":"Payload Too Large"}')
         var out = List[UInt8]()
-        append_str(out, "HTTP/1.1 413 Payload Too Large\r\ndate: " + http_date()
+        append_str(out, "HTTP/1.1 413 Payload Too Large\r\ndate: " + self.current_date()
                    + "\r\nserver: mojo-gate\r\ncontent-type: application/json\r\ncontent-length: "
                    + String(body.byte_length()) + "\r\nconnection: close\r\n\r\n" + body)
         self.conns[client].close_after = True
@@ -954,14 +1002,17 @@ struct Proxy:
 
     def on_upstream_data(mut self, ufd: Int, n: Int):
         var client = self.conns[ufd].peer
-        var data = List[UInt8](self.tmp[0:n])
         if client < 0:
             return
         if self.conns[client].state == C_TUNNEL:
+            var data = List[UInt8]()
+            for k in range(n):
+                data.append(self.tmp[k])
             self.send_bytes(client, data)
             return
         if not self.conns[ufd].hdr_done:
-            self.conns[ufd].resp.extend(data^)
+            for k in range(n):
+                self.conns[ufd].resp.append(self.tmp[k])
             var hend = find_crlfcrlf(self.conns[ufd].resp, 0)
             if hend < 0:
                 if len(self.conns[ufd].resp) > MAX_HEADER_BYTES:
@@ -970,6 +1021,9 @@ struct Proxy:
             self.forward_head(ufd, client, hend)
         else:
             self.conns[ufd].body_seen += n
+            var data = List[UInt8]()
+            for k in range(n):
+                data.append(self.tmp[k])
             if self.conns[ufd].capture:
                 if len(self.conns[ufd].resp) + n > self.entry_max_bytes:
                     self.conns[ufd].capture = False
@@ -1045,7 +1099,7 @@ struct Proxy:
             if resp[i] == 13 and resp[i + 1] == 10:
                 var drop = False
                 if keep and i - line_start == 17:
-                    drop = lower_ascii(latin1(resp, line_start, i)) == "connection: close"
+                    drop = bytes_equal_ci(resp, line_start, i, "connection: close")
                 if not drop:
                     for k in range(line_start, i + 2):
                         out.append(resp[k])
@@ -1118,7 +1172,7 @@ struct Proxy:
                 le += 1
             if le == cur:
                 break
-            if le - cur >= 5 and lower_ascii(latin1(resp, cur, cur + 5)) == "date:":
+            if le - cur >= 5 and bytes_equal_ci(resp, cur, cur + 5, "date:"):
                 d_start = cur
                 break
             cur = le + 2
@@ -1134,7 +1188,7 @@ struct Proxy:
             if le == ls:
                 break
             if ls != d_start:
-                var is_conn_close = (le - ls == 17 and lower_ascii(latin1(resp, ls, le)) == "connection: close")
+                var is_conn_close = (le - ls == 17 and bytes_equal_ci(resp, ls, le, "connection: close"))
                 if not is_conn_close:
                     for k in range(ls, le + 2):
                         rest_keep.append(resp[k])
@@ -1250,7 +1304,7 @@ struct Proxy:
         else:
             body = msg
         var out = List[UInt8]()
-        append_str(out, "HTTP/1.1 429 Too Many Requests\r\ndate: " + http_date()
+        append_str(out, "HTTP/1.1 429 Too Many Requests\r\ndate: " + self.current_date()
                    + "\r\nserver: mojo-gate\r\nretry-after: " + String(retry)
                    + "\r\nx-ratelimit-limit: " + String(limit)
                    + "\r\nx-ratelimit-remaining: 0\r\ncontent-length: " + String(body.byte_length())
@@ -1266,7 +1320,7 @@ struct Proxy:
         self.flush_cache()
         var body = String('{"status":"ok","purged":true}')
         var out = List[UInt8]()
-        append_str(out, "HTTP/1.1 200 OK\r\ndate: " + http_date()
+        append_str(out, "HTTP/1.1 200 OK\r\ndate: " + self.current_date()
                    + "\r\nserver: mojo-gate\r\ncontent-type: application/json\r\ncontent-length: "
                    + String(body.byte_length()) + "\r\n")
         if not keep:
@@ -1306,7 +1360,10 @@ struct Proxy:
             if len(inbuf) < r.head_len + r.body_len:
                 return  # wait for the body
             var consumed = r.head_len + r.body_len
-            self.conns[client].inbuf = List[UInt8](inbuf[consumed:len(inbuf)])
+            if consumed >= len(self.conns[client].inbuf):
+                self.conns[client].inbuf.clear()
+            else:
+                self.conns[client].inbuf = List[UInt8](inbuf[consumed:len(inbuf)])
             var keep = r.version == "HTTP/1.1" and not r.conn_close
             self.conns[client].keep_alive = keep
 
@@ -1409,17 +1466,20 @@ struct Proxy:
     # -- event handlers ------------------------------------------------------------
 
     def on_client_data(mut self, fd: Int, n: Int):
-        var data = List[UInt8](self.tmp[0:n])
         if self.conns[fd].state == C_TUNNEL:
             var peer = self.conns[fd].peer
             if peer >= 0:
+                var data = List[UInt8]()
+                for k in range(n):
+                    data.append(self.tmp[k])
                 self.send_bytes(peer, data)
             return
         if len(self.conns[fd].inbuf) + n > MAX_INBUF_BYTES:
             self.payload_too_large(fd)
             self.close_fd(fd)
             return
-        self.conns[fd].inbuf.extend(data^)
+        for k in range(n):
+            self.conns[fd].inbuf.append(self.tmp[k])
         if self.conns[fd].state == C_IDLE:
             self.process(fd)
 
