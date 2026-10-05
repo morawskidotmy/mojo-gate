@@ -60,11 +60,11 @@ pip install git+https://github.com/morawskidotmy/mojo-gate.git
 ## Architecture
 
 ```
-Client Requests
-      │
-      ▼
+             Client Requests
+                    │
+                    ▼
 ┌────────────────────────────────────────┐
-│     Mojo Gate Proxy (:8080)            │
+│        Mojo Gate Proxy (:8080)         │
 │  - Non-blocking epoll loop             │
 │  - Per-IP rate limiting (429)          │
 │  - In-memory cache (GET/HEAD hits)     │
