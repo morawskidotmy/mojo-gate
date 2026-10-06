@@ -263,6 +263,11 @@ def normalize_path(p: String) -> String:
     """RFC 3986 path normalization removing dot segments (. / ..) and multiple slashes."""
     if p.byte_length() == 0:
         return String("/")
+    # Fast path: an already-canonical path needs no transformation.
+    var pb = p.as_bytes()
+    var n = len(pb)
+    if pb[0] == 47 and pb[n - 1] != 47 and p.find(".") < 0 and p.find("//") < 0:
+        return p
     var parts = p.split("/")
     var stack = List[String]()
     for i in range(len(parts)):
@@ -581,8 +586,13 @@ def parse_request(buf: List[UInt8], internal_token: String = "", head_end: Int =
         raw_q = String(r.target[byte=q + 1:r.target.byte_length()])
     else:
         raw_p = r.target
-    var p_bytes = percent_decode_bytes(raw_p)
-    r.raw_path = normalize_path(latin1(p_bytes, 0, len(p_bytes)))
+    var decoded: String
+    if raw_p.find("%") >= 0:
+        var p_bytes = percent_decode_bytes(raw_p)
+        decoded = latin1(p_bytes, 0, len(p_bytes))
+    else:
+        decoded = raw_p  # no percent escapes: decoding is the identity
+    r.raw_path = normalize_path(decoded)
     r.raw_path_key = raw_p
     r.raw_query = raw_q
     var pos = i + 2
@@ -1617,9 +1627,9 @@ struct Proxy:
     def replay(mut self, client: Int, key: String, keep: Bool) -> Bool:
         """Send the cached response for `key` if present and fresh."""
         try:
-            if key not in self.cache or now_s() - self.cache[key].born >= self.cache_ttl_s:
+            _ = self.current_date()  # refresh cached_date_sec / cached_date_line
+            if key not in self.cache or self.cached_date_sec - self.cache[key].born >= self.cache_ttl_s:
                 return False
-            _ = self.current_date()  # refresh cached_date_line if the second rolled
             self.replay_buf.clear()
             self.replay_buf.extend(self.cache[key].status_line.copy())
             append_str(self.replay_buf, self.cached_date_line)
@@ -1771,12 +1781,14 @@ struct Proxy:
     def report_hits(mut self):
         if len(self.hits) == 0 or self.analytics_endpoint.byte_length() == 0:
             return
-        var body = String("[")
+        # Build the JSON body in a byte buffer: `String +=` in a loop is O(n^2).
+        var body = List[UInt8]()
+        body.append(91)  # '['
         for i in range(len(self.hits)):
             if i > 0:
-                body += ","
-            body += self.hits[i]
-        body += "]"
+                body.append(44)  # ','
+            append_str(body, self.hits[i])
+        body.append(93)  # ']'
         self.hits = List[String]()
         self.hits_bytes = 0
         var fd = external_call["socket", c_int](c_int(AF_INET), c_int(SOCK_STREAM), c_int(0))
@@ -1792,7 +1804,8 @@ struct Proxy:
                        + "Content-Type: application/json\r\nConnection: close\r\n"
                        + (("X-Mojo-Gate-Token: " + self.internal_token + "\r\n") if self.internal_token.byte_length() > 0 else "")
                        + "Content-Length: "
-                       + String(body.byte_length()) + "\r\n\r\n" + body)
+                       + String(len(body)) + "\r\n\r\n")
+            req.extend(body.copy())
             var off = 0
             while off < len(req):
                 var n = external_call["send", Int](fd, req.unsafe_ptr().unsafe_offset(off),

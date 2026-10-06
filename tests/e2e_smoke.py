@@ -572,6 +572,36 @@ def main() -> int:
         check(ws_up.pre_101 == b"", "no WS bytes sent before 101", repr(ws_up.pre_101))
         check(ws_up.post_101 == b"FRAME1FRAME2", "WS pre-101 bytes delivered in order", repr(ws_up.post_101))
 
+        # 31. normalization fast-path: non-canonical purge path still matches
+        np = c.request(
+            b"POST //_mojo_gate/purge HTTP/1.1\r\nHost: localhost\r\nX-Mojo-Gate-Token: " + TOKEN.encode()
+            + b"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        check(np.startswith(b"HTTP/1.1 200"), "non-canonical purge path normalized", np[:60].decode(errors="replace"))
+
+        # 32. pipelined requests on one connection are all answered in order
+        s = socket.create_connection(("127.0.0.1", port), timeout=5)
+        try:
+            s.sendall(
+                b"GET /api/items/31 HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n"
+                b"GET /api/items/32 HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n"
+                b"GET /api/items/33 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            )
+            s.settimeout(5)
+            piped = b""
+            while True:
+                try:
+                    chunk = s.recv(65536)
+                except TimeoutError:
+                    break
+                if not chunk:
+                    break
+                piped += chunk
+        finally:
+            s.close()
+        check(piped.count(b"HTTP/1.1 200") == 3, "pipelined requests answered", f"responses={piped.count(b'HTTP/1.1 200')}")
+        check(b'"/api/items/31"' in piped and b'"/api/items/33"' in piped, "pipelined responses in order")
+
     finally:
         for p in procs:
             p.terminate()

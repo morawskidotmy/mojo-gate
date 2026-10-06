@@ -93,7 +93,8 @@ def run(threads: int, requests: int, path: str = "/api/items/1", binary: str | N
     # Pin the proxy to one core so its CPU time is measurable despite the
     # (GIL-bound) Python load generator.
     if shutil.which("taskset"):
-        proxy_cmd = ["taskset", "-c", "0", *proxy_cmd]
+        cpu = os.environ.get("BENCH_CPU", "0")
+        proxy_cmd = ["taskset", "-c", cpu, *proxy_cmd]
     proc = subprocess.Popen(
         proxy_cmd,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
