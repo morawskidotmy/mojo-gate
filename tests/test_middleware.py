@@ -11,6 +11,42 @@ def test_is_front_proxy_active(monkeypatch):
     assert is_front_proxy_active()
 
 
+class _FakeResponse:
+    status = 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+def test_purge_cache_sends_internal_token(monkeypatch):
+    monkeypatch.setenv("MOJO_GATE_INTERNAL_TOKEN", "abc123")
+    captured: dict[str, str] = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured.update({k.lower(): v for k, v in req.header_items()})
+        return _FakeResponse()
+
+    monkeypatch.setattr("mojo_gate.middleware.urllib.request.urlopen", fake_urlopen)
+    assert purge_cache("http://127.0.0.1:9999") is True
+    assert captured.get("x-mojo-gate-token") == "abc123"
+
+
+def test_purge_cache_without_token_omits_header(monkeypatch):
+    monkeypatch.delenv("MOJO_GATE_INTERNAL_TOKEN", raising=False)
+    captured: dict[str, str] = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured.update({k.lower(): v for k, v in req.header_items()})
+        return _FakeResponse()
+
+    monkeypatch.setattr("mojo_gate.middleware.urllib.request.urlopen", fake_urlopen)
+    assert purge_cache("http://127.0.0.1:9999") is True
+    assert "x-mojo-gate-token" not in captured
+
+
 @pytest.mark.anyio
 async def test_middleware_normal_request(monkeypatch):
     monkeypatch.setenv("MOJO_GATE_FRONT_PROXY", "1")

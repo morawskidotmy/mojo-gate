@@ -25,9 +25,16 @@ def is_front_proxy_active() -> bool:
 def purge_cache(
     gate_url: str = "http://127.0.0.1:8000", purge_path: str = "/_mojo_gate/purge"
 ) -> bool:
-    """Send a purge request to the Mojo Gate front proxy to immediately flush its cache."""
+    """Send a purge request to the Mojo Gate front proxy to immediately flush its cache.
+
+    When running behind the front proxy the internal token is read from
+    ``MOJO_GATE_INTERNAL_TOKEN`` and sent so the proxy authorizes the purge.
+    """
     try:
         req = urllib.request.Request(f"{gate_url.rstrip('/')}{purge_path}", method="POST")
+        token = os.environ.get("MOJO_GATE_INTERNAL_TOKEN", "").strip()
+        if token:
+            req.add_header("X-Mojo-Gate-Token", token)
         with urllib.request.urlopen(req, timeout=2.0) as resp:
             return resp.status == 200
     except OSError:

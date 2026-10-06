@@ -14,7 +14,7 @@ Mojo Gate offloads connection multiplexing, HTTP caching, and sliding-window rat
 
 - **Epoll Event Loop**: Zero-overhead I/O multiplexing implemented directly in Mojo with non-blocking sockets and `TCP_NODELAY`.
 - **In-Memory Micro-Caching**: Safe `GET` and `HEAD` responses are cached in native memory. Cached hits bypass Python completely and are served in microseconds with dynamically regenerated RFC 7231 `Date` headers.
-- **Write-Invalidation & Purge API**: Any write request (`POST`, `PUT`, `DELETE`, `PATCH`) flushes the response cache automatically. Explicit cache purging is supported via `POST /_mojo_gate/purge`.
+- **Write-Invalidation & Purge API**: Any write request (`POST`, `PUT`, `DELETE`, `PATCH`) flushes the response cache automatically. Explicit cache purging is supported via `POST /_mojo_gate/purge` (authorized by the internal token when one is configured).
 - **Transparent Keep-Alive Proxying**: Relays requests to upstream Uvicorn with `Connection: close` while maintaining persistent client keep-alive connections.
 - **Per-IP Rate Limiting**: In-memory token-bucket sliding window rate limiting based on `X-Forwarded-For` client IPs, returning standard `429 Too Many Requests` responses with `Retry-After` headers.
 - **Full Protocol Tunneling**: Native pass-through for WebSockets (`Upgrade`), Server-Sent Events (SSE), chunked uploads, and `Expect: 100-continue`.

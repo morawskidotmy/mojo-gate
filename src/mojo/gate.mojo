@@ -50,6 +50,9 @@ comptime MAX_TARGET_BYTES = 4096
 comptime MAX_INBUF_BYTES = 16777216  # 16 MB max buffered client bytes
 comptime MAX_BUCKETS = 65536
 comptime MAX_HITS = 2048
+comptime MAX_HITS_BYTES = 1048576  # cap total serialized analytics payload (1 MB)
+comptime MAX_CONNS = 16384         # cap concurrent client connections
+comptime IDLE_TIMEOUT_S = 30       # idle client / upstream connection timeout
 
 # Client connection states
 comptime C_IDLE = 0      # reading / parsing requests
@@ -176,6 +179,7 @@ struct Request(Copyable, Movable):
     var method: String
     var target: String        # raw request-target
     var raw_path: String
+    var raw_path_key: String   # raw (undecoded) path used for the cache key
     var raw_query: String
     var version: String
     var head_len: Int         # bytes of request line + headers incl. CRLFCRLF
@@ -204,6 +208,7 @@ struct Request(Copyable, Movable):
         self.method = String("")
         self.target = String("")
         self.raw_path = String("")
+        self.raw_path_key = String("")
         self.raw_query = String("")
         self.version = String("")
         self.head_len = 0
@@ -345,6 +350,25 @@ def bytes_equal_ci(buf: List[UInt8], start: Int, end: Int, target: String) -> Bo
     return True
 
 
+def clamp_str(s: String, max_bytes: Int) -> String:
+    """Truncate to at most `max_bytes` (header bytes are ASCII-only, so this is safe)."""
+    if s.byte_length() <= max_bytes:
+        return s
+    return String(s[byte=0:max_bytes])
+
+
+def secure_eq(a: String, b: String) -> Bool:
+    """Constant-time byte comparison for secret tokens."""
+    var ab = a.as_bytes()
+    var bb = b.as_bytes()
+    if len(ab) != len(bb):
+        return False
+    var diff = 0
+    for i in range(len(ab)):
+        diff |= Int(ab[i]) ^ Int(bb[i])
+    return diff == 0
+
+
 def strip_ws(s: String) -> String:
     var bytes = s.as_bytes()
     var a = 0
@@ -413,6 +437,8 @@ def parse_int(s: String) -> Int:
         if b < 48 or b > 57:
             return -1
         v = v * 10 + Int(b) - 48
+        if v > 1_000_000_000_000_000:
+            return -2  # overflow guard; every caller bounds values far lower
     return v
 
 
@@ -529,9 +555,23 @@ def parse_request(buf: List[UInt8], internal_token: String = "") -> Request:
         r.bad_status = 400
         return r^
 
+    # Reject control bytes in the target (smuggling / log injection) and flag
+    # non-ASCII (such targets are never cached).
     for b in r.target.as_bytes():
-        if b > 126 or b < 33:
+        if b < 32:
+            r.ok = False
+            r.bad_status = 400
+            return r^
+        if b > 126:
             r.non_ascii = True
+    # This gateway is an origin server, not a forward proxy: only origin-form
+    # ("/path") and asterisk-form ("*") targets are accepted. Rejecting
+    # absolute-form ("http://evil/") prevents cache-key vs upstream routing
+    # divergence.
+    if r.method != "CONNECT" and r.target != "*" and not r.target.startswith("/"):
+        r.ok = False
+        r.bad_status = 400
+        return r^
     var q = r.target.find("?")
     var raw_p: String
     var raw_q = String("")
@@ -542,6 +582,7 @@ def parse_request(buf: List[UInt8], internal_token: String = "") -> Request:
         raw_p = r.target
     var p_bytes = percent_decode_bytes(raw_p)
     r.raw_path = normalize_path(latin1(p_bytes, 0, len(p_bytes)))
+    r.raw_path_key = raw_p
     r.raw_query = raw_q
     var pos = i + 2
     var first_xff = True
@@ -554,7 +595,10 @@ def parse_request(buf: List[UInt8], internal_token: String = "") -> Request:
             e += 1
         if e == pos:
             break
-        # Reject control characters (CRLF injection / smuggling)
+        # Reject control characters (CRLF injection / smuggling) and non-ASCII
+        # (obs-text) bytes. Header lines are re-encoded through UTF-8, which is
+        # not byte-preserving for obs-text and could inject CRLF into the
+        # upstream request; rejecting the whole class is the safe fix.
         for k in range(pos, e):
             var b = Int(buf[k])
             if b < 32 and b != 9:
@@ -562,7 +606,9 @@ def parse_request(buf: List[UInt8], internal_token: String = "") -> Request:
                 r.bad_status = 400
                 return r^
             if b > 126:
-                r.non_ascii = True
+                r.ok = False
+                r.bad_status = 400
+                return r^
         # Disallow leading whitespace in header lines (RFC 9112 §5.2)
         if buf[pos] == 32 or buf[pos] == 9:
             r.ok = False
@@ -622,6 +668,14 @@ def parse_request(buf: List[UInt8], internal_token: String = "") -> Request:
         elif name == "upgrade":
             r.upgrade = True
         elif name == "expect":
+            # Only 100-continue is understood; anything else must be rejected
+            # with 417 (RFC 9110 §10.1.1). This also prevents an Expect request
+            # with a large Content-Length from reaching the tunnel path before
+            # its body is buffered.
+            if lower_ascii(value) != "100-continue":
+                r.ok = False
+                r.bad_status = 417
+                return r^
             r.expect = True
         elif name == "connection":
             var lv = lower_ascii(value)
@@ -659,7 +713,7 @@ def parse_request(buf: List[UInt8], internal_token: String = "") -> Request:
         elif name == "x-forwarded-host":
             r.xfh = value
         elif name == "x-mojo-gate-token":
-            if internal_token.byte_length() > 0 and value == internal_token:
+            if internal_token.byte_length() > 0 and secure_eq(value, internal_token):
                 r.token_matched = True
         elif (name == "cookie" or name == "authorization" or name == "range"
               or name == "proxy-authorization" or name == "x-api-key"
@@ -715,7 +769,11 @@ def parse_host(value: String) -> String:
 
 
 def cache_key(r: Request, is_loopback: Bool) -> String:
-    var total_len = r.method.byte_length() + 1 + r.raw_path.byte_length() + 3 + 3 + 2 + r.host.byte_length()
+    # Use the raw (undecoded, unnormalized) path so the key is derived from the
+    # exact bytes forwarded upstream. Using the normalized path would let two
+    # distinct targets (e.g. `/a/../b` and `/b`) collide and serve each other's
+    # cached response.
+    var total_len = r.method.byte_length() + 1 + r.raw_path_key.byte_length() + 3 + 3 + 2 + r.host.byte_length()
     if r.raw_query.byte_length() > 0:
         total_len += 1 + r.raw_query.byte_length()
     if is_loopback:
@@ -724,7 +782,7 @@ def cache_key(r: Request, is_loopback: Bool) -> String:
     var k = List[UInt8](capacity=total_len)
     append_str(k, r.method)
     k.append(31)  # \x1f
-    append_str(k, r.raw_path)
+    append_str(k, r.raw_path_key)
     if r.raw_query.byte_length() > 0:
         k.append(63)  # '?'
         append_str(k, r.raw_query)
@@ -748,7 +806,8 @@ def cache_key(r: Request, is_loopback: Bool) -> String:
     return String(unsafe_from_utf8=k[0:len(k)])
 
 
-def upstream_request(r: Request, buf: List[UInt8], client_ip: String) -> List[UInt8]:
+def upstream_request(r: Request, buf: List[UInt8], client_ip: String,
+                     include_body: Bool = True) -> List[UInt8]:
     """The request as sent to upstream: same head with `Connection: close` and client IP."""
     var out = List[UInt8]()
     append_str(out, r.method + " " + r.target + " " + r.version + "\r\n")
@@ -764,13 +823,28 @@ def upstream_request(r: Request, buf: List[UInt8], client_ip: String) -> List[UI
                 or name == "x-mojo-gate-token"):
                 continue
             if name == "x-forwarded-for":
-                append_str(out, "X-Forwarded-For: " + r.xff + ", " + client_ip + "\r\n")
+                # Only a trusted loopback peer may chain its own XFF; an
+                # untrusted client's value is discarded and replaced.
+                if is_loopback:
+                    append_str(out, "X-Forwarded-For: " + r.xff + ", " + client_ip + "\r\n")
+                else:
+                    append_str(out, "X-Forwarded-For: " + client_ip + "\r\n")
                 forwarded_written = True
                 continue
             if name == "x-forwarded-proto":
                 if not is_loopback:
                     continue  # untrusted client cannot spoof scheme
                 proto_written = True
+            elif not is_loopback and (
+                name == "x-forwarded-host" or name == "x-forwarded-port"
+                or name == "x-forwarded-server" or name == "forwarded"
+                or name == "x-real-ip" or name == "x-client-ip"
+                or name == "x-original-url" or name == "x-rewrite-url"
+                or name == "x-forwarded-prefix"
+            ):
+                # Strip client-supplied forwarding/override headers so the app
+                # cannot be tricked into trusting attacker-controlled identity.
+                continue
         # header lines are latin-1 decoded; re-encode byte-for-byte
         for cp in l.codepoints():
             out.append(UInt8(Int(cp)))
@@ -783,8 +857,12 @@ def upstream_request(r: Request, buf: List[UInt8], client_ip: String) -> List[UI
         append_str(out, "Connection: Upgrade\r\n\r\n")
     else:
         append_str(out, "Connection: close\r\n\r\n")
-    for i in range(r.head_len, r.head_len + r.body_len):
-        out.append(buf[i])
+    if include_body:
+        var body_end = r.head_len + r.body_len
+        if body_end > len(buf):
+            body_end = len(buf)  # never read past the buffered bytes
+        for i in range(r.head_len, body_end):
+            out.append(buf[i])
     return out^
 
 
@@ -801,16 +879,19 @@ struct Proxy:
     var entry_max_bytes: Int
     var rate_limit: Bool
     var rate_rules: List[RateRule]
+    var rate_max_window: Int              # largest configured window (bucket pruning)
     var rate_limit_msg: String
     var no_cache_prefixes: List[String]
     var analytics_endpoint: String
     var purge_endpoint: String
     var internal_token: String
     var conns: List[Conn]
+    var client_count: Int                 # active non-upstream connections
     var cache: Dict[String, Entry]
     var cache_bytes: Int
     var buckets: Dict[String, List[Int]]  # "ip|prefix" -> request times (ms)
     var hits: List[String]                # analytics JSON items to report
+    var hits_bytes: Int
     var tmp: List[UInt8]
     var cached_date_sec: Int
     var cached_date_str: String
@@ -830,16 +911,23 @@ struct Proxy:
         self.entry_max_bytes = entry_max_bytes
         self.rate_limit = rate_limit
         self.rate_rules = rate_rules^
+        var mw = 60
+        for i in range(len(self.rate_rules)):
+            if self.rate_rules[i].window_s > mw:
+                mw = self.rate_rules[i].window_s
+        self.rate_max_window = mw
         self.rate_limit_msg = rate_limit_msg
         self.no_cache_prefixes = no_cache_prefixes^
         self.analytics_endpoint = analytics_endpoint
         self.purge_endpoint = purge_endpoint
         self.internal_token = internal_token
         self.conns = List[Conn]()
+        self.client_count = 0
         self.cache = Dict[String, Entry]()
         self.cache_bytes = 0
         self.buckets = Dict[String, List[Int]]()
         self.hits = List[String]()
+        self.hits_bytes = 0
         self.tmp = List[UInt8](length=65536, fill=0)
         self.cached_date_sec = 0
         self.cached_date_str = http_date()
@@ -869,6 +957,8 @@ struct Proxy:
         self.conns[fd] = Conn()
         self.conns[fd].active = True
         self.conns[fd].upstream = upstream
+        if not upstream:
+            self.client_count += 1
 
     def close_fd(mut self, fd: Int):
         if fd < 0 or fd >= len(self.conns) or not self.conns[fd].active:
@@ -877,6 +967,8 @@ struct Proxy:
         _ = external_call["epoll_ctl", c_int](self.epfd, c_int(EPOLL_CTL_DEL), c_int(fd), Pointer(to=ev))
         _ = external_call["close", c_int](c_int(fd))
         var peer = self.conns[fd].peer
+        if not self.conns[fd].upstream and self.client_count > 0:
+            self.client_count -= 1
         self.conns[fd] = Conn()
         if peer >= 0 and peer < len(self.conns) and self.conns[peer].active:
             self.conns[peer].peer = -1
@@ -1000,6 +1092,16 @@ struct Proxy:
         self.conns[client].state = C_IDLE
         self.send_bytes(client, out)
 
+    def expectation_failed(mut self, client: Int):
+        var body = String('{"detail":"Expectation Failed"}')
+        var out = List[UInt8]()
+        append_str(out, "HTTP/1.1 417 Expectation Failed\r\ndate: " + self.current_date()
+                   + "\r\nserver: mojo-gate\r\ncontent-type: application/json\r\ncontent-length: "
+                   + String(body.byte_length()) + "\r\nconnection: close\r\n\r\n" + body)
+        self.conns[client].close_after = True
+        self.conns[client].state = C_IDLE
+        self.send_bytes(client, out)
+
     def on_upstream_data(mut self, ufd: Int, n: Int):
         var client = self.conns[ufd].peer
         if client < 0:
@@ -1065,9 +1167,21 @@ struct Proxy:
                     or lv.find("s-maxage=0") >= 0):
                     no_store = True
             elif name == "vary":
+                # The cache key only encodes a fixed set of request dimensions.
+                # If the response varies on anything else, refuse to cache it.
                 var lv = lower_ascii(value)
                 if lv.find("*") >= 0:
                     no_store = True
+                else:
+                    var vtoks = lv.split(",")
+                    for vi in range(len(vtoks)):
+                        var vt = strip_ws(String(vtoks[vi]))
+                        if vt.byte_length() == 0:
+                            continue
+                        if not (vt == "accept-encoding" or vt == "origin" or vt == "host"
+                                or vt == "x-forwarded-proto" or vt == "x-forwarded-host"):
+                            no_store = True
+                            break
             elif name == "content-range":
                 no_store = True
         if cl >= 0 and chunked:
@@ -1251,13 +1365,17 @@ struct Proxy:
 
     # -- rate limiting -------------------------------------------------------------
 
-    def rate_check(mut self, path: List[UInt8], ip: String) -> Int:
-        """Return 0 if allowed, else retry_after * 100000 + limit."""
+    def rate_check(mut self, path: String, ip: String) -> Int:
+        """Return 0 if allowed, else retry_after * 100000 + limit.
+
+        `path` must already be the percent-decoded, normalized path
+        (`Request.raw_path`) so the limiter matches exactly what is served.
+        """
         if not self.rate_limit or len(self.rate_rules) == 0:
             return 0
         var matched = -1
         for i in range(len(self.rate_rules)):
-            if bytes_startswith(path, self.rate_rules[i].prefix):
+            if path.startswith(self.rate_rules[i].prefix):
                 matched = i
                 break
         if matched < 0:
@@ -1344,6 +1462,8 @@ struct Proxy:
             if not r.ok:
                 if r.bad_status == 413:
                     self.payload_too_large(client)
+                elif r.bad_status == 417:
+                    self.expectation_failed(client)
                 elif r.bad_status == 501:
                     var body = String('{"detail":"Not Implemented"}')
                     var out = List[UInt8]()
@@ -1372,11 +1492,18 @@ struct Proxy:
                 self.forbidden(client, "Direct access to internal analytics is forbidden")
                 return
 
-            # Check cache purge endpoint (allow only from loopback or internal token)
+            # Check cache purge endpoint. When an internal token is configured
+            # it is always required, so a loopback peer (e.g. a local reverse
+            # proxy or a browser on the host) cannot flush the cache unauth.
             if self.purge_endpoint.byte_length() > 0 and r.raw_path == self.purge_endpoint and (r.method == "POST" or r.method == "DELETE" or r.method == "PURGE"):
                 var peer_ip = self.conns[client].client_ip
-                if peer_ip != "127.0.0.1" and peer_ip != "::1" and not r.token_matched:
-                    self.forbidden(client, "Cache purge allowed only from loopback")
+                var authorized: Bool
+                if self.internal_token.byte_length() > 0:
+                    authorized = r.token_matched
+                else:
+                    authorized = (peer_ip == "127.0.0.1" or peer_ip == "::1")
+                if not authorized:
+                    self.forbidden(client, "Cache purge not authorized")
                     return
                 self.handle_purge(client, keep)
                 if not keep:
@@ -1384,13 +1511,12 @@ struct Proxy:
                     self.flush(client)
                 return
 
-            var path = percent_decode_bytes(r.raw_path)
             # Determine client IP: only trust X-Forwarded-For if request came from trusted loopback
             var ip = self.conns[client].client_ip
             if r.has_xff and (ip == "127.0.0.1" or ip == "::1"):
                 ip = client_ip(r)
 
-            var verdict = self.rate_check(path, ip)
+            var verdict = self.rate_check(r.raw_path, ip)
             if verdict > 0:
                 self.too_many(client, verdict // 100000, verdict % 100000)
                 if not keep:
@@ -1403,9 +1529,14 @@ struct Proxy:
             if self.is_cacheable(r):
                 key = cache_key(r, ip == "127.0.0.1" or ip == "::1")
                 if self.replay(client, key, keep):
-                    if self.analytics_endpoint.byte_length() > 0 and len(self.hits) < MAX_HITS:
-                        self.hits.append("[" + json_str(r.raw_path) + "," + json_str(r.raw_query) + ","
-                                         + json_str(ip) + "," + json_str(r.user_agent) + "]")
+                    if (self.analytics_endpoint.byte_length() > 0 and len(self.hits) < MAX_HITS
+                            and self.hits_bytes < MAX_HITS_BYTES):
+                        var item = ("[" + json_str(clamp_str(r.raw_path, 512)) + ","
+                                    + json_str(clamp_str(r.raw_query, 512)) + ","
+                                    + json_str(clamp_str(ip, 64)) + ","
+                                    + json_str(clamp_str(r.user_agent, 256)) + "]")
+                        self.hits.append(item)
+                        self.hits_bytes += item.byte_length()
                     if not keep:
                         self.conns[client].close_after = True
                         self.flush(client)
@@ -1450,7 +1581,10 @@ struct Proxy:
         if ufd < 0:
             self.bad_gateway(client)
             return
-        self.conns[ufd].out = upstream_request(r, inbuf, self.conns[client].client_ip)
+        # The body is streamed by the tunnel and never copied by
+        # `upstream_request` here: that would both duplicate the body and read
+        # out of bounds when it has not been buffered yet (e.g. Expect).
+        self.conns[ufd].out = upstream_request(r, inbuf, self.conns[client].client_ip, False)
         if not r.upgrade:
             self.conns[client].state = C_TUNNEL
             for k in range(r.head_len, len(inbuf)):
@@ -1458,10 +1592,11 @@ struct Proxy:
             self.conns[client].inbuf = List[UInt8]()
         else:
             self.conns[client].state = C_WAITING
-            if len(inbuf) > r.head_len:
-                self.conns[client].inbuf = List[UInt8](inbuf[r.head_len:len(inbuf)])
-            else:
-                self.conns[client].inbuf = List[UInt8]()
+            # Bytes sent immediately after the upgrade request belong on the
+            # upstream connection; keeping them in inbuf would strand them.
+            for k in range(r.head_len, len(inbuf)):
+                self.conns[ufd].out.append(inbuf[k])
+            self.conns[client].inbuf = List[UInt8]()
 
     # -- event handlers ------------------------------------------------------------
 
@@ -1542,6 +1677,7 @@ struct Proxy:
             body += self.hits[i]
         body += "]"
         self.hits = List[String]()
+        self.hits_bytes = 0
         var fd = external_call["socket", c_int](c_int(AF_INET), c_int(SOCK_STREAM), c_int(0))
         if fd < 0:
             return
@@ -1569,10 +1705,11 @@ struct Proxy:
 
     def prune_buckets(mut self):
         var now_ms = Int(monotonic() // 1_000_000)
+        var max_age_ms = self.rate_max_window * 1000
         var dead = List[String]()
         for item in self.buckets.items():
             var b = item.value.copy()
-            if len(b) == 0 or now_ms - b[len(b) - 1] > 60_000:
+            if len(b) == 0 or now_ms - b[len(b) - 1] > max_age_ms:
                 dead.append(item.key)
         for k in dead:
             try:
@@ -1582,9 +1719,29 @@ struct Proxy:
 
     def reap_stale(mut self, now: Int):
         for fd in range(len(self.conns)):
-            if self.conns[fd].active and not self.conns[fd].upstream:
-                if now - self.conns[fd].last_active > 30:
-                    self.close_fd(fd)
+            if not self.conns[fd].active:
+                continue
+            if now - self.conns[fd].last_active <= IDLE_TIMEOUT_S:
+                continue
+            if self.conns[fd].upstream:
+                # Do not time out long-lived tunnels (WebSocket/SSE/streaming).
+                if self.conns[fd].state == C_TUNNEL:
+                    continue
+                # A stalled upstream must not pin the client forever: fail the
+                # waiting client with 502 rather than hanging.
+                var client = self.conns[fd].peer
+                self.conns[fd].peer = -1
+                if client >= 0 and client < len(self.conns) and self.conns[client].active:
+                    self.conns[client].peer = -1
+                self.close_fd(fd)
+                if client >= 0 and client < len(self.conns) and self.conns[client].active:
+                    self.bad_gateway(client)
+            else:
+                # Idle client connections (including idle keep-alive and
+                # slowloris header dribble) are reaped; tunnels are exempt.
+                if self.conns[fd].state == C_TUNNEL:
+                    continue
+                self.close_fd(fd)
 
 
 # ─── command-line and main ───────────────────────────────────────────────────
@@ -1764,6 +1921,11 @@ def main() raises:
                                                                  c_int(SOCK_NONBLOCK | SOCK_CLOEXEC)))
                     if cfd < 0:
                         break
+                    if p.client_count >= MAX_CONNS:
+                        # Backpressure: refuse new clients rather than
+                        # exhausting memory under a connection flood.
+                        _ = external_call["close", c_int](c_int(cfd))
+                        continue
                     _ = external_call["setsockopt", c_int](c_int(cfd), c_int(IPPROTO_TCP), c_int(TCP_NODELAY),
                                                            Pointer(to=on), c_size_t(4))
                     p.open_fd(cfd, False)
