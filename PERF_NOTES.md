@@ -26,12 +26,16 @@ assume an unverified property.
 
 ## Consciously accepted risks / invariants
 
-1. **Header re-encoding relies on parser-enforced ASCII headers.**
-   `upstream_request` re-encodes header lines with `as_bytes()`, which is only
-   byte-preserving because `parse_request` rejects any header byte `> 126`.
-   Do not relax that validation without revisiting the re-encode.
-2. **`replay_buf` retains peak response capacity** (up to `entry_max_bytes`,
-   8 MB) for the process lifetime after a large cache hit. Bounded; acceptable.
+1. **Header re-encoding is byte-preserving.** `upstream_request` re-encodes
+   header lines with `as_bytes()`, and `latin1` builds them with
+   `unsafe_from_utf8`, so the round-trip preserves the original bytes for any
+   input. The parser additionally rejects non-ASCII header bytes as
+   defense-in-depth; the forwarding path does not depend on that rejection for
+   correctness.
+2. **`replay_buf` retention is capped.** The cache-hit replay buffer retains its
+   capacity between hits but is released once it exceeds `REPLAY_BUF_MAX`
+   (1 MB), so a single large response cannot pin `entry_max_bytes` for the
+   process lifetime.
 3. **`send_replay` duplicates `send_bytes`' partial-send / `close_after` logic.**
    Any fix to one must be applied to the other (or they should be unified via a
    raw-pointer `send_raw`).
@@ -44,9 +48,9 @@ assume an unverified property.
    `inbuf` per request. Removing it (move-out) is not expressible in this Mojo
    version (`error: expression does not designate a value with an origin` when
    moving out of an indexed list element). A read-offset cursor would be needed.
-7. **`report_hits` blocks the event loop** once per second on a loopback
-   connect/send/recv (2 s socket timeouts). Analytics is an optional feature;
-   accepted.
+7. **Analytics reporting is bounded and non-blocking.** `report_hits` uses a
+   non-blocking socket and `poll` deadlines (connect ~200 ms, drain budget
+   ~300 ms), dropping the batch on timeout instead of stalling the event loop.
 
 ## Measurement
 

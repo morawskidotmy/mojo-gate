@@ -238,3 +238,19 @@ cfg = MojoGateConfig.from_env()     # typed config object
 
 The equivalent CLI form is `mojo-gate serve app:app --env-file .env`.
 
+---
+
+## Forwarded headers & trust
+
+Mojo Gate always sets `X-Forwarded-For` to the TCP peer address and, for
+non-loopback peers, strips client-supplied `X-Forwarded-Host/Proto/Port/Server`,
+`Forwarded`, `X-Real-IP`, `X-Client-IP`, `X-Original-URL` and `X-Rewrite-URL` so
+the upstream cannot be tricked into trusting attacker-controlled identity.
+
+`X-Forwarded-For` is only *chained* (appended) when the peer is loopback
+(`127.0.0.1`/`::1`), i.e. when Mojo Gate sits behind a trusted local load
+balancer / reverse proxy that sanitizes the header. If Mojo Gate is exposed
+directly, clients are not loopback and their forwarded headers are replaced.
+Make sure any local fronting proxy strips inbound `X-Forwarded-*` before
+forwarding, or the app will see spoofed values.
+

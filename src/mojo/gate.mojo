@@ -37,6 +37,8 @@ comptime EAGAIN = 11
 comptime EINPROGRESS = 115
 comptime EMFILE = 24
 comptime ENFILE = 23
+comptime POLLIN = 1
+comptime POLLOUT = 4
 
 comptime EPOLLIN = 1
 comptime EPOLLOUT = 4
@@ -55,6 +57,7 @@ comptime MAX_BUCKETS = 65536
 comptime MAX_HITS = 2048
 comptime MAX_HITS_BYTES = 1048576  # cap total serialized analytics payload (1 MB)
 comptime MAX_CONNS = 16384         # cap concurrent client connections
+comptime REPLAY_BUF_MAX = 1048576  # cap retained cache-hit replay buffer (1 MB)
 
 # Client connection states
 comptime C_IDLE = 0      # reading / parsing requests
@@ -91,13 +94,15 @@ struct EpollEvent(TrivialRegisterPassable):
         self.pad = 0
 
 
-struct TimeVal(TrivialRegisterPassable):
-    var tv_sec: Int64
-    var tv_usec: Int64
+struct PollFd(TrivialRegisterPassable):
+    var fd: Int32
+    var events: Int16
+    var revents: Int16
 
-    def __init__(out self, sec: Int64):
-        self.tv_sec = sec
-        self.tv_usec = 0
+    def __init__(out self, fd: Int32, events: Int16):
+        self.fd = fd
+        self.events = events
+        self.revents = 0
 
 
 struct RateRule(Copyable, Movable, ImplicitlyCopyable):
@@ -1470,8 +1475,14 @@ struct Proxy:
             if len(self.buckets) >= MAX_BUCKETS:
                 self.prune_buckets()
                 if len(self.buckets) >= MAX_BUCKETS:
-                    return 0  # fail-open on bucket table overflow to avoid OOM
-            self.buckets[key] = List[Int]()
+                    # Fail closed: charge all new keys against one shared bucket
+                    # per rule so memory stays bounded but the limit still holds
+                    # (an attacker cannot mint unlimited buckets to bypass it).
+                    key = "\x00overflow|" + prefix
+                    if key not in self.buckets:
+                        self.buckets[key] = List[Int]()
+            if key not in self.buckets:
+                self.buckets[key] = List[Int]()
         try:
             var b = self.buckets[key].copy()
             var start = 0
@@ -1655,6 +1666,10 @@ struct Proxy:
         except:
             return False
         self.send_replay(client)
+        if len(self.replay_buf) > REPLAY_BUF_MAX:
+            # Release the retained capacity after a large response so the buffer
+            # does not pin entry_max_bytes for the process lifetime.
+            self.replay_buf = List[UInt8]()
         return True
 
     def send_replay(mut self, fd: Int):
@@ -1805,30 +1820,59 @@ struct Proxy:
         body.append(93)  # ']'
         self.hits = List[String]()
         self.hits_bytes = 0
-        var fd = external_call["socket", c_int](c_int(AF_INET), c_int(SOCK_STREAM), c_int(0))
+        # Best-effort, non-blocking: the whole exchange is bounded by poll
+        # deadlines so a slow/unresponsive analytics endpoint cannot stall the
+        # event loop.
+        var fd = external_call["socket", c_int](
+            c_int(AF_INET), c_int(SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC), c_int(0))
         if fd < 0:
             return
-        var tv = TimeVal(2)
-        _ = external_call["setsockopt", c_int](fd, c_int(SOL_SOCKET), c_int(SO_RCVTIMEO), Pointer(to=tv), c_size_t(16))
-        _ = external_call["setsockopt", c_int](fd, c_int(SOL_SOCKET), c_int(SO_SNDTIMEO), Pointer(to=tv), c_size_t(16))
         var addr = SockAddrIn(self.upstream_port, self.upstream_host_ip)
-        if external_call["connect", c_int](fd, Pointer(to=addr), c_int(size_of[SockAddrIn]())) == 0:
-            var req = List[UInt8]()
-            append_str(req, "POST " + self.analytics_endpoint + " HTTP/1.1\r\nHost: 127.0.0.1\r\n"
-                       + "Content-Type: application/json\r\nConnection: close\r\n"
-                       + (("X-Mojo-Gate-Token: " + self.internal_token + "\r\n") if self.internal_token.byte_length() > 0 else "")
-                       + "Content-Length: "
-                       + String(len(body)) + "\r\n\r\n")
-            req.extend(body.copy())
-            var off = 0
-            while off < len(req):
-                var n = external_call["send", Int](fd, req.unsafe_ptr().unsafe_offset(off),
-                                                   c_size_t(len(req) - off), c_int(0x4000))
-                if n <= 0:
-                    break
+        var rc = external_call["connect", c_int](fd, Pointer(to=addr), c_int(size_of[SockAddrIn]()))
+        if rc < 0 and errno() != EINPROGRESS:
+            _ = external_call["close", c_int](fd)
+            return
+        var wpoll = PollFd(Int32(fd), Int16(POLLOUT))
+        if external_call["poll", c_int](Pointer(to=wpoll), c_size_t(1), c_int(200)) <= 0:
+            _ = external_call["close", c_int](fd)
+            return
+        var err = c_int(0)
+        var elen = c_int(4)
+        _ = external_call["getsockopt", c_int](c_int(fd), c_int(SOL_SOCKET), c_int(SO_ERROR),
+                                               Pointer(to=err), Pointer(to=elen))
+        if err != 0:
+            _ = external_call["close", c_int](fd)
+            return
+        var req = List[UInt8]()
+        append_str(req, "POST " + self.analytics_endpoint + " HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                   + "Content-Type: application/json\r\nConnection: close\r\n"
+                   + (("X-Mojo-Gate-Token: " + self.internal_token + "\r\n") if self.internal_token.byte_length() > 0 else "")
+                   + "Content-Length: "
+                   + String(len(body)) + "\r\n\r\n")
+        req.extend(body.copy())
+        var off = 0
+        while off < len(req):
+            var n = external_call["send", Int](fd, req.unsafe_ptr().unsafe_offset(off),
+                                               c_size_t(len(req) - off), c_int(0x4000))
+            if n > 0:
                 off += n
-            while external_call["recv", Int](fd, self.tmp.unsafe_ptr(), c_size_t(65536), c_int(0)) > 0:
-                pass
+                continue
+            if n < 0 and errno() == EAGAIN:
+                var spoll = PollFd(Int32(fd), Int16(POLLOUT))
+                if external_call["poll", c_int](Pointer(to=spoll), c_size_t(1), c_int(200)) <= 0:
+                    break
+                continue
+            break
+        # Drain the response (best-effort) with a bounded budget.
+        if off >= len(req):
+            var budget = 300
+            while budget > 0:
+                var rpoll = PollFd(Int32(fd), Int16(POLLIN))
+                if external_call["poll", c_int](Pointer(to=rpoll), c_size_t(1), c_int(budget)) <= 0:
+                    break
+                if external_call["recv", Int](fd, self.tmp.unsafe_ptr(), c_size_t(65536), c_int(0)) <= 0:
+                    break
+                budget -= 50
         _ = external_call["close", c_int](fd)
 
     def prune_buckets(mut self):

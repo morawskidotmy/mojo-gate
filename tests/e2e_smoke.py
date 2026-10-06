@@ -647,6 +647,13 @@ def main() -> int:
         check(up.count("GET /api/items/41") == 1, "//api does not reuse /api cache entry", f"count={up.count('GET /api/items/41')}")
         check(up.count("GET //api/items/41") == 1, "//api cached under its own key", f"count={up.count('GET //api/items/41')}")
 
+        # 40. cache hits are reported to the analytics endpoint (bounded, non-blocking)
+        ac.get("/api/items/50")
+        settle()
+        ac.get("/api/items/50")  # cache hit -> queued for the reporter
+        reported = wait_for(lambda: up.count("POST /_mojo_gate/analytics") >= 1, timeout=3.0)
+        check(reported, "analytics hits reported", f"count={up.count('POST /_mojo_gate/analytics')}")
+
     finally:
         for p in procs:
             p.terminate()
