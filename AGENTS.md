@@ -102,9 +102,24 @@ app.add_middleware(
 | `port` | `8000` | The public-facing port the Mojo proxy listens on |
 | `upstream_port` | `port + 3` | The internal loopback port Uvicorn listens on |
 | `cache_ttl` | `60` | Time-to-live (seconds) for cached safe `GET`/`HEAD` responses |
+| `entry_max_bytes` | `8388608` | Maximum size of a single cached response |
 | `rate_rules` | `None` | List of `(path_prefix, limit, window_seconds)` tuples for per-IP rate limiting |
+| `rate_limit_msg` | `{"detail":"Too Many Requests","retry_after":{retry}}` | JSON body returned on `429` |
 | `no_cache_prefixes`| `["/_mojo_gate"]`| URL prefixes to exclude from native caching |
+| `analytics_endpoint` | `""` | Upstream endpoint that receives batched cache-hit telemetry |
 | `purge_endpoint` | `/_mojo_gate/purge`| Internal endpoint to trigger on-demand cache flush |
+| `server_header` | `mojo-gate` | `server:` value on proxy-generated responses (set to `uvicorn` for parity) |
+| `idle_timeout` | `30` | Idle client/upstream timeout in seconds |
+
+### Configuring via `.env`
+
+All of the above can be set in a `.env` file instead of passing many CLI flags.
+`mojo_gate.serve(...)` loads `.env` from the working directory automatically (or
+the path given by `env_file=` / `--env-file` / `$MOJO_GATE_ENV_FILE`). Keys use
+the `MOJO_GATE_` prefix (`MOJO_GATE_PORT`, `MOJO_GATE_RATE_RULES`,
+`MOJO_GATE_NO_CACHE_PREFIXES`, `MOJO_GATE_SERVER_HEADER`, ...). Existing
+environment variables are never overwritten, and an explicitly passed argument
+wins over the `.env` value. See the README "Configuration via `.env`" section.
 
 ---
 

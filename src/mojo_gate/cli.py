@@ -39,27 +39,49 @@ def main(argv: list[str] | None = None) -> int:
     p_serve = subparsers.add_parser("serve", help="Serve a Python ASGI app behind Mojo Gate")
     p_serve.add_argument("app", help="Application import string, e.g. 'main:app'")
     p_serve.add_argument(
-        "--host", default="127.0.0.1", help="Public bind address (default: 127.0.0.1)"
+        "--host", default=None, help="Public bind address (default: 127.0.0.1)"
     )
     p_serve.add_argument(
-        "--port", type=int, default=8000, help="Public port to listen on (default: 8000)"
+        "--port", type=int, default=None, help="Public port to listen on (default: 8000)"
     )
     p_serve.add_argument(
-        "--upstream-host", default="127.0.0.1", help="Upstream host (default: 127.0.0.1)"
+        "--upstream-host", default=None, help="Upstream host (default: 127.0.0.1)"
     )
     p_serve.add_argument(
         "--upstream-port", type=int, default=None, help="Upstream app port (default: port + 3)"
     )
     p_serve.add_argument(
-        "--cache-ttl", type=int, default=60, help="Cache TTL in seconds (default: 60)"
+        "--cache-ttl", type=int, default=None, help="Cache TTL in seconds (default: 60)"
     )
     p_serve.add_argument(
         "--cache-max-bytes",
         type=int,
-        default=256 * 1024 * 1024,
+        default=None,
         help="Max cache bytes (default: 256MB)",
     )
     p_serve.add_argument("--no-rate-limit", action="store_true", help="Disable rate limiting")
+    p_serve.add_argument(
+        "--entry-max-bytes",
+        type=int,
+        default=None,
+        help="Max size of a single cached response (default: 8MB)",
+    )
+    p_serve.add_argument(
+        "--rate-limit-msg",
+        default=None,
+        help="JSON body returned on 429 ({retry} placeholder supported)",
+    )
+    p_serve.add_argument(
+        "--server-header",
+        default=None,
+        help="`server:` header value on proxy-generated responses (default: mojo-gate)",
+    )
+    p_serve.add_argument(
+        "--idle-timeout",
+        type=int,
+        default=None,
+        help="Idle client/upstream timeout in seconds (default: 30)",
+    )
     p_serve.add_argument(
         "--rate-rule",
         action="append",
@@ -74,10 +96,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Path prefix to exclude from caching (repeatable)",
     )
     p_serve.add_argument(
-        "--analytics-endpoint", default="", help="Upstream endpoint to report cache hits"
+        "--analytics-endpoint", default=None, help="Upstream endpoint to report cache hits"
     )
     p_serve.add_argument(
-        "--purge-endpoint", default="/_mojo_gate/purge", help="Endpoint to purge cache via POST"
+        "--purge-endpoint", default=None, help="Endpoint to purge cache via POST"
+    )
+    p_serve.add_argument(
+        "--env-file", default=None, help="Path to a .env file with MOJO_GATE_* settings"
     )
     p_serve.add_argument(
         "--reload", action="store_true", help="Enable auto-reload (bypasses front proxy)"
@@ -132,11 +157,16 @@ def main(argv: list[str] | None = None) -> int:
             upstream_port=args.upstream_port,
             cache_ttl=args.cache_ttl,
             cache_max_bytes=args.cache_max_bytes,
-            rate_limit=not args.no_rate_limit,
+            entry_max_bytes=args.entry_max_bytes,
+            rate_limit=False if args.no_rate_limit else None,
             rate_rules=args.rate_rules,
+            rate_limit_msg=args.rate_limit_msg,
             no_cache_prefixes=args.no_cache_prefixes,
             analytics_endpoint=args.analytics_endpoint,
             purge_endpoint=args.purge_endpoint,
+            server_header=args.server_header,
+            idle_timeout=args.idle_timeout,
+            env_file=args.env_file,
             reload=args.reload,
             log_level=args.log_level,
         )

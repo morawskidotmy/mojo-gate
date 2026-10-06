@@ -61,6 +61,7 @@ class Upstream:
         self.last_headers: dict[str, str] = {}
         self.last_raw_headers: list[tuple[str, str]] = []
         self.last_body: bytes = b""
+        self.bodies: dict[str, bytes] = {}
         self.lock = threading.Lock()
         self._stop = False
         self.thread = threading.Thread(target=self._serve, daemon=True)
@@ -129,6 +130,7 @@ class Upstream:
                 self.last_headers = headers
                 self.last_raw_headers = raw_headers
                 self.last_body = rest[:cl]
+                self.bodies[key] = rest[:cl]
             body = b'{"path":"%s","n":%d}' % (target, n)
             extra = b""
             if b"/cors" in target:
@@ -335,7 +337,8 @@ def main() -> int:
     an_port = _free_port()
     an_proc = subprocess.Popen(
         [*base_cmd, "--port", str(an_port), "--no-rate-limit",
-         "--analytics-endpoint", "/_mojo_gate/analytics"],
+         "--analytics-endpoint", "/_mojo_gate/analytics",
+         "--server-header", "uvicorn"],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
     procs.append(an_proc)
@@ -445,7 +448,8 @@ def main() -> int:
             b"Expect: 100-continue\r\nConnection: close\r\n\r\nhello world"
         )
         settle(0.3)
-        check(wait_for(lambda: up.last_body == b"hello world"), "Expect body delivered exactly once", repr(up.last_body))
+        check(wait_for(lambda: up.bodies.get("POST /echo") == b"hello world"),
+              "Expect body delivered exactly once", repr(up.bodies.get("POST /echo")))
 
         # 16. untrusted forwarding headers are stripped (needs a non-loopback peer)
         if ext_ip:
@@ -552,7 +556,7 @@ def main() -> int:
         finally:
             t.close()
         check(out.startswith(b"HTTP/1.1 200"), "chunked tunnel not reaped mid-stream", out[:60].decode(errors="replace"))
-        check(wait_for(lambda: up.last_body == b"hello"), "chunked body delivered intact", repr(up.last_body))
+        check(wait_for(lambda: up.bodies.get("POST /chunked") == b"hello"), "chunked body delivered intact", repr(up.bodies.get("POST /chunked")))
 
         # 30. WebSocket pre-101 bytes are buffered then delivered in order
         ws = socket.create_connection(("127.0.0.1", ws_port), timeout=10)
@@ -601,6 +605,47 @@ def main() -> int:
             s.close()
         check(piped.count(b"HTTP/1.1 200") == 3, "pipelined requests answered", f"responses={piped.count(b'HTTP/1.1 200')}")
         check(b'"/api/items/31"' in piped and b'"/api/items/33"' in piped, "pipelined responses in order")
+
+        # 33. leading empty line before the request line is tolerated (RFC 9112 §2.2)
+        lead = c.request(b"\r\nGET /api/items/40 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        check(lead.startswith(b"HTTP/1.1 200"), "leading CRLF tolerated", lead[:60].decode(errors="replace"))
+
+        # 34. over-long request target -> 414
+        long_target = b"GET /" + b"a" * 5000 + b" HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        t414 = c.request(long_target)
+        check(t414.startswith(b"HTTP/1.1 414"), "over-long target -> 414", t414[:60].decode(errors="replace"))
+
+        # 35. unsupported HTTP version -> 505
+        v505 = c.request(b"GET / HTTP/2.0\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        check(v505.startswith(b"HTTP/1.1 505"), "HTTP/2.0 -> 505", v505[:60].decode(errors="replace"))
+
+        # 36. 501 includes a date header
+        t501 = c.request(b"POST /x HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: gzip\r\nConnection: close\r\n\r\n")
+        check(t501.startswith(b"HTTP/1.1 501") and b"date:" in t501.lower(), "501 has date header", t501[:80].decode(errors="replace"))
+
+        # 37. hop-by-hop headers are stripped before forwarding (RFC 9110 §7.6.1)
+        c.get(
+            "/hop",
+            extra="Connection: close, X-Foo-Header\r\nTE: trailers\r\nTrailer: X-Trailer\r\n"
+                  "Proxy-Authenticate: Basic\r\nProxy-Authorization: Basic\r\nX-Foo-Header: leak\r\n",
+        )
+        hh = {k for k, _ in up.last_raw_headers}
+        check(not ({"te", "trailer", "proxy-authenticate", "proxy-authorization", "x-foo-header"} & hh),
+              "hop-by-hop headers stripped", repr(sorted(hh)))
+
+        # 38. server header is configurable on synthesized responses
+        # (an_proc was started with --server-header uvicorn)
+        hdr = ac.get("/_mojo_gate/analytics")
+        check(b"server: uvicorn" in hdr.lower(), "synthesized server header configurable", hdr[:80].decode(errors="replace"))
+
+        # 39. raw request-target is the cache key: //api does not share /api's entry
+        c.get("/api/items/41")
+        settle()
+        c.get("//api/items/41")
+        settle()
+        c.get("/api/items/41")
+        check(up.count("GET /api/items/41") == 1, "//api does not reuse /api cache entry", f"count={up.count('GET /api/items/41')}")
+        check(up.count("GET //api/items/41") == 1, "//api cached under its own key", f"count={up.count('GET //api/items/41')}")
 
     finally:
         for p in procs:

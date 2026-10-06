@@ -182,8 +182,59 @@ def clear_cache():
 | `--cache-max-bytes`| `268435456` (256MB) | Maximum total in-memory cache capacity |
 | `--entry-max-bytes`| `8388608` (8MB) | Maximum size of an individual cached response |
 | `--rate-rule` | None | Rate rule formatted as `prefix:limit:window_s` (repeatable) |
+| `--rate-limit-msg` | `{"detail":"Too Many Requests","retry_after":{retry}}` | JSON body returned on `429` (`{retry}` placeholder supported) |
 | `--no-rate-limit` | `False` | Disable native rate limiting |
 | `--purge-endpoint` | `/_mojo_gate/purge` | Endpoint to instantly flush cache via `POST` or `DELETE` |
+| `--server-header` | `mojo-gate` | `server:` header value on proxy-generated responses (set to your upstream's value for byte-identical parity) |
 | `--idle-timeout` | `30` | Seconds before an idle client or stalled upstream connection is reaped |
+| `--env-file` | `.env` | Path to a `.env` file with `MOJO_GATE_*` settings |
 | `--no-mojo` | `False` | Bypass Mojo Gate and run Uvicorn alone |
 | `--reload` | `False` | Enable auto-reload (automatically runs Uvicorn alone) |
+
+---
+
+## Configuration via `.env`
+
+Instead of a long wall of CLI flags, put the settings in a `.env` file. When
+`mojo_gate.serve(...)` runs it loads `.env` from the working directory (or the
+path in `--env-file` / `$MOJO_GATE_ENV_FILE`). Only `MOJO_GATE_*` keys are
+consumed, existing environment variables always win, and an explicitly passed
+argument beats the `.env` value.
+
+```dotenv
+# .env
+MOJO_GATE_HOST=127.0.0.1
+MOJO_GATE_PORT=8095
+MOJO_GATE_UPSTREAM_PORT=8098
+MOJO_GATE_CACHE_TTL=120
+MOJO_GATE_CACHE_MAX_BYTES=268435456
+MOJO_GATE_ENTRY_MAX_BYTES=8388608
+MOJO_GATE_RATE_RULES=/api/search:90:60,/source:240:60,/api:400:60
+MOJO_GATE_RATE_LIMIT_MSG={"detail":"zbyt wiele żądań","retry_after":{retry}}
+MOJO_GATE_NO_CACHE_PREFIXES=/_mojo_gate,/question/,/mcp,/source,/pdf
+MOJO_GATE_ANALYTICS_ENDPOINT=/_mojo_gate/analytics
+MOJO_GATE_PURGE_ENDPOINT=/_mojo_gate/purge
+MOJO_GATE_SERVER_HEADER=uvicorn
+MOJO_GATE_IDLE_TIMEOUT=30
+MOJO_GATE_RATE_LIMIT=true
+```
+
+Then the application code is just:
+
+```python
+import mojo_gate
+
+mojo_gate.serve("search_matugen.server:app", health_path="/api/health")
+```
+
+You can also load the file yourself and read the values:
+
+```python
+from mojo_gate import MojoGateConfig, load_dotenv
+
+load_dotenv()                       # populates os.environ from .env
+cfg = MojoGateConfig.from_env()     # typed config object
+```
+
+The equivalent CLI form is `mojo-gate serve app:app --env-file .env`.
+

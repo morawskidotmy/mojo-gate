@@ -28,6 +28,7 @@ from typing import Any
 import uvicorn
 
 from mojo_gate.compiler import ensure_binary
+from mojo_gate.config import MojoGateConfig
 
 _PR_SET_PDEATHSIG = 1
 
@@ -65,17 +66,22 @@ def _wait_healthy(host: str, port: int, timeout: float = 30.0, health_path: str 
 def serve(
     app: str | Any,
     *,
-    port: int = 8000,
-    host: str = "127.0.0.1",
+    port: int | None = None,
+    host: str | None = None,
     upstream_port: int | None = None,
-    upstream_host: str = "127.0.0.1",
-    cache_ttl: int = 60,
-    cache_max_bytes: int = 256 * 1024 * 1024,
-    rate_limit: bool = True,
+    upstream_host: str | None = None,
+    cache_ttl: int | None = None,
+    cache_max_bytes: int | None = None,
+    entry_max_bytes: int | None = None,
+    rate_limit: bool | None = None,
     rate_rules: list[tuple[str, int, int]] | None = None,
+    rate_limit_msg: str | None = None,
     no_cache_prefixes: list[str] | None = None,
-    analytics_endpoint: str = "",
-    purge_endpoint: str = "/_mojo_gate/purge",
+    analytics_endpoint: str | None = None,
+    purge_endpoint: str | None = None,
+    server_header: str | None = None,
+    idle_timeout: int | None = None,
+    env_file: str | None = None,
     fallback_to_uvicorn: bool = True,
     reload: bool = False,
     log_level: str = "info",
@@ -84,9 +90,35 @@ def serve(
 ) -> bool:
     """Run `app` on `upstream_port` behind the Mojo front proxy on `port`.
 
+    Options left as ``None`` are resolved from ``MOJO_GATE_*`` environment
+    variables and, when present, a ``.env`` file (``env_file`` or
+    ``$MOJO_GATE_ENV_FILE``, defaulting to ``.env`` in the working directory).
+    Explicit arguments always win.
+
     Returns True if run with front proxy, or False if fallen back to running
     the app alone.
     """
+    cfg = MojoGateConfig.from_env(
+        env_file=env_file or os.environ.get("MOJO_GATE_ENV_FILE") or ".env"
+    )
+    port = cfg.port if port is None else port
+    host = cfg.host if host is None else host
+    upstream_host = cfg.upstream_host if upstream_host is None else upstream_host
+    upstream_port = cfg.upstream_port if upstream_port is None else upstream_port
+    cache_ttl = cfg.cache_ttl if cache_ttl is None else cache_ttl
+    cache_max_bytes = cfg.cache_max_bytes if cache_max_bytes is None else cache_max_bytes
+    entry_max_bytes = cfg.entry_max_bytes if entry_max_bytes is None else entry_max_bytes
+    rate_limit = cfg.rate_limit if rate_limit is None else rate_limit
+    rate_rules = cfg.rate_rules if rate_rules is None else rate_rules
+    rate_limit_msg = cfg.rate_limit_msg if rate_limit_msg is None else rate_limit_msg
+    no_cache_prefixes = cfg.no_cache_prefixes if no_cache_prefixes is None else no_cache_prefixes
+    analytics_endpoint = (
+        cfg.analytics_endpoint if analytics_endpoint is None else analytics_endpoint
+    )
+    purge_endpoint = cfg.purge_endpoint if purge_endpoint is None else purge_endpoint
+    server_header = cfg.server_header if server_header is None else server_header
+    idle_timeout = cfg.idle_timeout if idle_timeout is None else idle_timeout
+
     if reload:
         _log("reload enabled: serving the Python app alone without front proxy")
         uvicorn.run(app, host=host, port=port, reload=True, log_level=log_level, **uvicorn_kwargs)
@@ -130,8 +162,14 @@ def serve(
         str(cache_ttl),
         "--cache-max-bytes",
         str(cache_max_bytes),
+        "--entry-max-bytes",
+        str(entry_max_bytes),
         "--purge-endpoint",
         purge_endpoint,
+        "--server-header",
+        server_header,
+        "--idle-timeout",
+        str(idle_timeout),
         "--internal-token",
         internal_token,
     ]
@@ -140,6 +178,7 @@ def serve(
     elif rate_rules:
         rules_str = ",".join(f"{p}:{lim}:{win}" for p, lim, win in rate_rules)
         cmd.extend(["--rate-rules", rules_str])
+        cmd.extend(["--rate-limit-msg", rate_limit_msg])
 
     if no_cache_prefixes:
         cmd.extend(["--no-cache-prefixes", ",".join(no_cache_prefixes)])

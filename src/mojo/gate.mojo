@@ -203,6 +203,7 @@ struct Request(Copyable, Movable):
     var non_ascii: Bool
     var token_matched: Bool    # X-Mojo-Gate-Token matched internal secret
     var lines: List[String]    # header lines (raw), to rebuild the upstream request
+    var conn_tokens: List[String]  # lowercased tokens listed in Connection
 
     def __init__(out self):
         self.ok = False
@@ -232,6 +233,7 @@ struct Request(Copyable, Movable):
         self.non_ascii = False
         self.token_matched = False
         self.lines = List[String]()
+        self.conn_tokens = List[String]()
 
 
 # ─── small helpers ─────────────────────────────────────────────────────────
@@ -309,6 +311,15 @@ def find_crlfcrlf(buf: List[UInt8], start: Int) -> Int:
             return i + 4
         i += 1
     return -1
+
+
+def skip_leading_crlf(buf: List[UInt8]) -> Int:
+    """Offset of the request line, ignoring leading empty line(s) (RFC 9112 §2.2)."""
+    var n = len(buf)
+    var i = 0
+    while i + 1 < n and buf[i] == 13 and buf[i + 1] == 10:
+        i += 2
+    return i
 
 
 def latin1(buf: List[UInt8], start: Int, end: Int) -> String:
@@ -517,18 +528,19 @@ def http_date() -> String:
 # ─── request parsing ───────────────────────────────────────────────────────
 
 
-def parse_request(buf: List[UInt8], internal_token: String = "", head_end: Int = -1) -> Request:
+def parse_request(buf: List[UInt8], internal_token: String = "", head_end: Int = -1,
+                  head_start: Int = 0) -> Request:
     """Parse the request head at the start of `buf` (caller checked CRLFCRLF)."""
     var r = Request()
     var end = head_end if head_end >= 0 else find_crlfcrlf(buf, 0)
     if end < 0:
         return r^
     r.head_len = end
-    # request line
-    var i = 0
+    # request line (skip any leading empty line(s), RFC 9112 §2.2)
+    var i = head_start
     while i + 1 < end and not (buf[i] == 13 and buf[i + 1] == 10):
         i += 1
-    var line = latin1(buf, 0, i)
+    var line = latin1(buf, head_start, i)
     var parts = line.split(" ")
     if len(parts) != 3:
         r.ok = False
@@ -555,10 +567,10 @@ def parse_request(buf: List[UInt8], internal_token: String = "", head_end: Int =
         r.bad_status = 414  # URI Too Long
         return r^
 
-    # Validate HTTP version (RFC 9112 §2.3)
+    # Validate HTTP version (RFC 9112 §2.3): unsupported major/minor -> 505.
     if r.version != "HTTP/1.1" and r.version != "HTTP/1.0":
         r.ok = False
-        r.bad_status = 400
+        r.bad_status = 505 if r.version.startswith("HTTP/") else 400
         return r^
 
     # Reject control bytes in the target (smuggling / log injection) and flag
@@ -696,6 +708,12 @@ def parse_request(buf: List[UInt8], internal_token: String = "", head_end: Int =
                 r.conn_keep = True
             if lv.find("upgrade") >= 0:
                 r.upgrade = True
+            # Collect the field names listed as hop-by-hop so they can be
+            # stripped before forwarding (RFC 9110 §7.6.1).
+            for tok in lv.split(","):
+                var t = strip_ws(String(tok))
+                if t.byte_length() > 0:
+                    r.conn_tokens.append(t)
         elif name == "x-forwarded-for":
             if first_xff:
                 r.xff = value
@@ -835,8 +853,20 @@ def upstream_request(r: Request, buf: List[UInt8], client_ip: String,
         if colon > 0:
             var name = lower_ascii(String(l[byte=0:colon]))
             if (name == "connection" or name == "keep-alive" or name == "proxy-connection"
-                or name == "x-mojo-gate-token"):
+                or name == "x-mojo-gate-token" or name == "te" or name == "trailer"
+                or name == "proxy-authenticate" or name == "proxy-authorization"):
                 continue
+            # Strip every field name listed in Connection (RFC 9110 §7.6.1).
+            # "close"/"keep-alive"/"upgrade" are handled by the proxy itself, so
+            # they are not treated as headers to remove.
+            if name != "close" and name != "upgrade":
+                var listed = False
+                for ci in range(len(r.conn_tokens)):
+                    if name == r.conn_tokens[ci]:
+                        listed = True
+                        break
+                if listed:
+                    continue
             if name == "x-forwarded-for":
                 # Emit exactly one XFF: only a trusted loopback peer may chain
                 # its own value; an untrusted client's is replaced.
@@ -900,6 +930,7 @@ struct Proxy:
     var rate_max_window: Int              # largest configured window (bucket pruning)
     var idle_timeout_s: Int               # idle client / upstream timeout
     var rate_limit_msg: String
+    var server_header: String             # value of the `server:` header on synthesized responses
     var no_cache_prefixes: List[String]
     var analytics_endpoint: String
     var purge_endpoint: String
@@ -923,7 +954,8 @@ struct Proxy:
                  rate_limit: Bool, var rate_rules: List[RateRule],
                  rate_limit_msg: String, var no_cache_prefixes: List[String],
                  analytics_endpoint: String, purge_endpoint: String,
-                 internal_token: String, idle_timeout_s: Int = 30):
+                 internal_token: String, idle_timeout_s: Int = 30,
+                 server_header: String = "mojo-gate"):
         self.epfd = 0
         self.listen_fd = 0
         self.upstream_host_ip = upstream_host_ip
@@ -940,6 +972,7 @@ struct Proxy:
         self.rate_max_window = mw
         self.idle_timeout_s = idle_timeout_s
         self.rate_limit_msg = rate_limit_msg
+        self.server_header = server_header
         self.no_cache_prefixes = no_cache_prefixes^
         self.analytics_endpoint = analytics_endpoint
         self.purge_endpoint = purge_endpoint
@@ -1081,64 +1114,45 @@ struct Proxy:
         self.watch(ufd, True, True)
         return ufd
 
-    def bad_gateway(mut self, client: Int):
-        var body = String('{"detail":"Bad Gateway"}')
+    def error_response(mut self, client: Int, code: Int, reason: String, detail: String):
+        """Synthesized error response: date + configurable `server` + JSON body."""
+        var body = String('{"detail":"') + detail + String('"}')
         var out = List[UInt8]()
-        append_str(out, "HTTP/1.1 502 Bad Gateway\r\nserver: mojo-gate\r\ncontent-type: application/json\r\ncontent-length: "
+        append_str(out, "HTTP/1.1 " + String(code) + " " + reason + "\r\ndate: " + self.current_date()
+                   + "\r\nserver: " + self.server_header
+                   + "\r\ncontent-type: application/json\r\ncontent-length: "
                    + String(body.byte_length()) + "\r\nconnection: close\r\n\r\n" + body)
         self.conns[client].close_after = True
         self.conns[client].state = C_IDLE
         self.send_bytes(client, out)
+
+    def bad_gateway(mut self, client: Int):
+        self.error_response(client, 502, "Bad Gateway", "Bad Gateway")
 
     def bad_request(mut self, client: Int, msg: String = "Bad Request"):
-        var body = String('{"detail":"') + msg + String('"}')
-        var out = List[UInt8]()
-        append_str(out, "HTTP/1.1 400 Bad Request\r\ndate: " + self.current_date()
-                   + "\r\nserver: mojo-gate\r\ncontent-type: application/json\r\ncontent-length: "
-                   + String(body.byte_length()) + "\r\nconnection: close\r\n\r\n" + body)
-        self.conns[client].close_after = True
-        self.conns[client].state = C_IDLE
-        self.send_bytes(client, out)
+        self.error_response(client, 400, "Bad Request", msg)
 
     def forbidden(mut self, client: Int, msg: String = "Forbidden"):
-        var body = String('{"detail":"') + msg + String('"}')
-        var out = List[UInt8]()
-        append_str(out, "HTTP/1.1 403 Forbidden\r\ndate: " + self.current_date()
-                   + "\r\nserver: mojo-gate\r\ncontent-type: application/json\r\ncontent-length: "
-                   + String(body.byte_length()) + "\r\nconnection: close\r\n\r\n" + body)
-        self.conns[client].close_after = True
-        self.conns[client].state = C_IDLE
-        self.send_bytes(client, out)
+        self.error_response(client, 403, "Forbidden", msg)
 
     def payload_too_large(mut self, client: Int):
-        var body = String('{"detail":"Payload Too Large"}')
-        var out = List[UInt8]()
-        append_str(out, "HTTP/1.1 413 Payload Too Large\r\ndate: " + self.current_date()
-                   + "\r\nserver: mojo-gate\r\ncontent-type: application/json\r\ncontent-length: "
-                   + String(body.byte_length()) + "\r\nconnection: close\r\n\r\n" + body)
-        self.conns[client].close_after = True
-        self.conns[client].state = C_IDLE
-        self.send_bytes(client, out)
+        self.error_response(client, 413, "Payload Too Large", "Payload Too Large")
+
+    def uri_too_long(mut self, client: Int):
+        self.error_response(client, 414, "URI Too Long", "URI Too Long")
 
     def expectation_failed(mut self, client: Int):
-        var body = String('{"detail":"Expectation Failed"}')
-        var out = List[UInt8]()
-        append_str(out, "HTTP/1.1 417 Expectation Failed\r\ndate: " + self.current_date()
-                   + "\r\nserver: mojo-gate\r\ncontent-type: application/json\r\ncontent-length: "
-                   + String(body.byte_length()) + "\r\nconnection: close\r\n\r\n" + body)
-        self.conns[client].close_after = True
-        self.conns[client].state = C_IDLE
-        self.send_bytes(client, out)
+        self.error_response(client, 417, "Expectation Failed", "Expectation Failed")
 
     def headers_too_large(mut self, client: Int):
-        var body = String('{"detail":"Request Header Fields Too Large"}')
-        var out = List[UInt8]()
-        append_str(out, "HTTP/1.1 431 Request Header Fields Too Large\r\ndate: " + self.current_date()
-                   + "\r\nserver: mojo-gate\r\ncontent-type: application/json\r\ncontent-length: "
-                   + String(body.byte_length()) + "\r\nconnection: close\r\n\r\n" + body)
-        self.conns[client].close_after = True
-        self.conns[client].state = C_IDLE
-        self.send_bytes(client, out)
+        self.error_response(client, 431, "Request Header Fields Too Large",
+                            "Request Header Fields Too Large")
+
+    def not_implemented(mut self, client: Int):
+        self.error_response(client, 501, "Not Implemented", "Not Implemented")
+
+    def version_not_supported(mut self, client: Int):
+        self.error_response(client, 505, "HTTP Version Not Supported", "HTTP Version Not Supported")
 
     def on_upstream_data(mut self, ufd: Int, n: Int):
         var client = self.conns[ufd].peer
@@ -1487,7 +1501,7 @@ struct Proxy:
             body = msg
         var out = List[UInt8]()
         append_str(out, "HTTP/1.1 429 Too Many Requests\r\ndate: " + self.current_date()
-                   + "\r\nserver: mojo-gate\r\nretry-after: " + String(retry)
+                   + "\r\nserver: " + self.server_header + "\r\nretry-after: " + String(retry)
                    + "\r\nx-ratelimit-limit: " + String(limit)
                    + "\r\nx-ratelimit-remaining: 0\r\ncontent-length: " + String(body.byte_length())
                    + "\r\ncontent-type: application/json\r\n")
@@ -1503,7 +1517,7 @@ struct Proxy:
         var body = String('{"status":"ok","purged":true}')
         var out = List[UInt8]()
         append_str(out, "HTTP/1.1 200 OK\r\ndate: " + self.current_date()
-                   + "\r\nserver: mojo-gate\r\ncontent-type: application/json\r\ncontent-length: "
+                   + "\r\nserver: " + self.server_header + "\r\ncontent-type: application/json\r\ncontent-length: "
                    + String(body.byte_length()) + "\r\n")
         if not keep:
             append_str(out, "connection: close\r\n")
@@ -1517,7 +1531,8 @@ struct Proxy:
         while self.conns[client].active and self.conns[client].state == C_IDLE \
                 and not self.conns[client].close_after:
             var inbuf = self.conns[client].inbuf.copy()
-            var hend = find_crlfcrlf(inbuf, 0)
+            var hstart = skip_leading_crlf(inbuf)
+            var hend = find_crlfcrlf(inbuf, hstart)
             if hend < 0:
                 if len(inbuf) > MAX_HEADER_BYTES:
                     self.bad_request(client, "Header size exceeds limit")
@@ -1525,19 +1540,18 @@ struct Proxy:
             if hend > MAX_HEADER_BYTES:
                 self.headers_too_large(client)
                 return
-            var r = parse_request(inbuf, self.internal_token, hend)
+            var r = parse_request(inbuf, self.internal_token, hend, hstart)
             if not r.ok:
                 if r.bad_status == 413:
                     self.payload_too_large(client)
+                elif r.bad_status == 414:
+                    self.uri_too_long(client)
                 elif r.bad_status == 417:
                     self.expectation_failed(client)
                 elif r.bad_status == 501:
-                    var body = String('{"detail":"Not Implemented"}')
-                    var out = List[UInt8]()
-                    append_str(out, "HTTP/1.1 501 Not Implemented\r\ncontent-length: "
-                               + String(body.byte_length()) + "\r\nconnection: close\r\n\r\n" + body)
-                    self.conns[client].close_after = True
-                    self.send_bytes(client, out)
+                    self.not_implemented(client)
+                elif r.bad_status == 505:
+                    self.version_not_supported(client)
                 else:
                     self.bad_request(client, "Malformed request or invalid headers")
                 return
@@ -1923,6 +1937,7 @@ def print_usage():
     print("  --analytics-endpoint <url> Upstream endpoint for hit reporting (empty to disable)")
     print("  --purge-endpoint <url>     Endpoint to purge cache via POST/DELETE (default: /_mojo_gate/purge)")
     print("  --idle-timeout <seconds>   Idle client/upstream timeout (default: 30)")
+    print("  --server-header <value>    `server:` value on synthesized responses (default: mojo-gate)")
     print("  -h, --help                 Show this help message and exit")
 
 
@@ -1942,6 +1957,7 @@ def main() raises:
     var purge_endpoint = String("/_mojo_gate/purge")
     var internal_token = String("")
     var idle_timeout = 30
+    var server_header = String("mojo-gate")
 
     var args = argv()
     var i = 1
@@ -1992,6 +2008,9 @@ def main() raises:
         elif a == "--idle-timeout" and i + 1 < len(args):
             idle_timeout = parse_int(String(args[i + 1]))
             i += 2
+        elif a == "--server-header" and i + 1 < len(args):
+            server_header = String(args[i + 1])
+            i += 2
         else:
             i += 1
 
@@ -2002,7 +2021,7 @@ def main() raises:
 
     var p = Proxy(upstream_host_ip, upstream_port, cache_ttl, cache_max_bytes, entry_max_bytes,
                   rate_limit, rate_rules^, rate_limit_msg, no_cache_prefixes^,
-                  analytics_endpoint, purge_endpoint, internal_token, idle_timeout)
+                  analytics_endpoint, purge_endpoint, internal_token, idle_timeout, server_header)
 
     var lfd = external_call["socket", c_int](c_int(AF_INET), c_int(SOCK_STREAM), c_int(0))
     if lfd < 0:
