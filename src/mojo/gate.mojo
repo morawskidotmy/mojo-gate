@@ -292,8 +292,7 @@ def now_s() -> Int:
 
 
 def append_str(mut buf: List[UInt8], s: String):
-    for b in s.as_bytes():
-        buf.append(b)
+    buf.extend(s.as_bytes())
 
 
 def find_crlfcrlf(buf: List[UInt8], start: Int) -> Int:
@@ -513,10 +512,10 @@ def http_date() -> String:
 # ─── request parsing ───────────────────────────────────────────────────────
 
 
-def parse_request(buf: List[UInt8], internal_token: String = "") -> Request:
+def parse_request(buf: List[UInt8], internal_token: String = "", head_end: Int = -1) -> Request:
     """Parse the request head at the start of `buf` (caller checked CRLFCRLF)."""
     var r = Request()
-    var end = find_crlfcrlf(buf, 0)
+    var end = head_end if head_end >= 0 else find_crlfcrlf(buf, 0)
     if end < 0:
         return r^
     r.head_len = end
@@ -856,9 +855,8 @@ def upstream_request(r: Request, buf: List[UInt8], client_ip: String,
                 # Strip client-supplied forwarding/override headers so the app
                 # cannot be tricked into trusting attacker-controlled identity.
                 continue
-        # header lines are latin-1 decoded; re-encode byte-for-byte
-        for cp in l.codepoints():
-            out.append(UInt8(Int(cp)))
+        # header lines are ASCII-only (non-ASCII is rejected at parse time)
+        out.extend(l.as_bytes())
         append_str(out, "\r\n")
     if not forwarded_written and client_ip.byte_length() > 0:
         append_str(out, "X-Forwarded-For: " + client_ip + "\r\n")
@@ -872,8 +870,7 @@ def upstream_request(r: Request, buf: List[UInt8], client_ip: String,
         var body_end = r.head_len + r.body_len
         if body_end > len(buf):
             body_end = len(buf)  # never read past the buffered bytes
-        for i in range(r.head_len, body_end):
-            out.append(buf[i])
+        out.extend(buf[r.head_len:body_end])
     return out^
 
 
@@ -906,8 +903,10 @@ struct Proxy:
     var hits: List[String]                # analytics JSON items to report
     var hits_bytes: Int
     var tmp: List[UInt8]
+    var replay_buf: List[UInt8]
     var cached_date_sec: Int
     var cached_date_str: String
+    var cached_date_line: String
 
     def __init__(out self, upstream_host_ip: UInt32, upstream_port: Int,
                  cache_ttl_s: Int, cache_max_bytes: Int, entry_max_bytes: Int,
@@ -944,14 +943,17 @@ struct Proxy:
         self.hits = List[String]()
         self.hits_bytes = 0
         self.tmp = List[UInt8](length=65536, fill=0)
+        self.replay_buf = List[UInt8]()
         self.cached_date_sec = 0
         self.cached_date_str = http_date()
+        self.cached_date_line = "date: " + self.cached_date_str + "\r\n"
 
     def current_date(mut self) -> String:
         var now = now_s()
         if now != self.cached_date_sec:
             self.cached_date_sec = now
             self.cached_date_str = http_date()
+            self.cached_date_line = "date: " + self.cached_date_str + "\r\n"
         return self.cached_date_str
 
     def slot(mut self, fd: Int):
@@ -1012,8 +1014,7 @@ struct Proxy:
                     self.close_fd(fd)
                 return
             elif n > 0:
-                for k in range(n, len(data)):
-                    self.conns[fd].out.append(data[k])
+                self.conns[fd].out.extend(data[n:len(data)])
                 self.conns[fd].out_off = 0
                 if not self.conns[fd].want_out:
                     self.watch(fd, True, False)
@@ -1021,8 +1022,7 @@ struct Proxy:
             elif n < 0 and errno() != EAGAIN:
                 self.close_fd(fd)
                 return
-        for k in range(len(data)):
-            self.conns[fd].out.append(data[k])
+        self.conns[fd].out.extend(data.copy())
         self.flush(fd)
 
     def flush(mut self, fd: Int):
@@ -1052,11 +1052,11 @@ struct Proxy:
     # -- upstream ---------------------------------------------------------------
 
     def connect_upstream(mut self, client: Int) -> Int:
-        var ufd = Int(external_call["socket", c_int](c_int(AF_INET), c_int(SOCK_STREAM), c_int(0)))
+        var ufd = Int(external_call["socket", c_int](
+            c_int(AF_INET), c_int(SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC), c_int(0)))
         if ufd < 0:
             return -1
         var on = c_int(1)
-        _ = external_call["ioctl", c_int](c_int(ufd), c_int(FIONBIO), Pointer(to=on))
         _ = external_call["setsockopt", c_int](c_int(ufd), c_int(IPPROTO_TCP), c_int(TCP_NODELAY),
                                                Pointer(to=on), c_size_t(4))
         var addr = SockAddrIn(self.upstream_port, self.upstream_host_ip)
@@ -1135,14 +1135,11 @@ struct Proxy:
         if client < 0:
             return
         if self.conns[client].state == C_TUNNEL:
-            var data = List[UInt8]()
-            for k in range(n):
-                data.append(self.tmp[k])
+            var data = List[UInt8](self.tmp[0:n])
             self.send_bytes(client, data)
             return
         if not self.conns[ufd].hdr_done:
-            for k in range(n):
-                self.conns[ufd].resp.append(self.tmp[k])
+            self.conns[ufd].resp.extend(self.tmp[0:n])
             # Loop so that interim 1xx heads followed by the final head in the
             # same read are all handled (forward_head leaves the remaining bytes
             # in `resp` for an interim response).
@@ -1157,15 +1154,13 @@ struct Proxy:
                     return
         else:
             self.conns[ufd].body_seen += n
-            var data = List[UInt8]()
-            for k in range(n):
-                data.append(self.tmp[k])
+            var data = List[UInt8](self.tmp[0:n])
             if self.conns[ufd].capture:
                 if len(self.conns[ufd].resp) + n > self.entry_max_bytes:
                     self.conns[ufd].capture = False
                     self.conns[ufd].resp = List[UInt8]()
                 else:
-                    self.conns[ufd].resp.extend(data.copy())
+                    self.conns[ufd].resp.extend(self.tmp[0:n])
             self.send_bytes(client, data)
             if (self.conns[ufd].capture and self.conns[ufd].cl >= 0
                     and self.conns[ufd].body_seen >= self.conns[ufd].cl):
@@ -1271,8 +1266,7 @@ struct Proxy:
                 if keep and i - line_start == 17:
                     drop = bytes_equal_ci(resp, line_start, i, "connection: close")
                 if not drop:
-                    for k in range(line_start, i + 2):
-                        out.append(resp[k])
+                    out.extend(resp[line_start:i + 2])
                 line_start = i + 2
                 i += 2
                 if line_start == hend - 2:
@@ -1280,8 +1274,7 @@ struct Proxy:
                 continue
             i += 1
         append_str(out, "\r\n")
-        for k in range(hend, len(resp)):
-            out.append(resp[k])
+        out.extend(resp[hend:len(resp)])
         if not self.conns[ufd].capture:
             self.conns[ufd].resp = List[UInt8]()
         self.send_bytes(client, out)
@@ -1522,7 +1515,7 @@ struct Proxy:
             if hend > MAX_HEADER_BYTES:
                 self.headers_too_large(client)
                 return
-            var r = parse_request(inbuf, self.internal_token)
+            var r = parse_request(inbuf, self.internal_token, hend)
             if not r.ok:
                 if r.bad_status == 413:
                     self.payload_too_large(client)
@@ -1623,21 +1616,46 @@ struct Proxy:
 
     def replay(mut self, client: Int, key: String, keep: Bool) -> Bool:
         """Send the cached response for `key` if present and fresh."""
-        var out = List[UInt8]()
         try:
             if key not in self.cache or now_s() - self.cache[key].born >= self.cache_ttl_s:
                 return False
-            out.extend(self.cache[key].status_line.copy())
-            append_str(out, "date: " + self.current_date() + "\r\n")
+            _ = self.current_date()  # refresh cached_date_line if the second rolled
+            self.replay_buf.clear()
+            self.replay_buf.extend(self.cache[key].status_line.copy())
+            append_str(self.replay_buf, self.cached_date_line)
             if keep:
-                out.extend(self.cache[key].rest_keep.copy())
+                self.replay_buf.extend(self.cache[key].rest_keep.copy())
             else:
-                out.extend(self.cache[key].rest_close.copy())
-            out.extend(self.cache[key].body.copy())
+                self.replay_buf.extend(self.cache[key].rest_close.copy())
+            self.replay_buf.extend(self.cache[key].body.copy())
         except:
             return False
-        self.send_bytes(client, out)
+        self.send_replay(client)
         return True
+
+    def send_replay(mut self, fd: Int):
+        """Send `self.replay_buf`, retaining its capacity for the next hit."""
+        if fd < 0 or fd >= len(self.conns) or not self.conns[fd].active:
+            return
+        if len(self.conns[fd].out) == 0:
+            var n = external_call["send", Int](
+                c_int(fd), self.replay_buf.unsafe_ptr(),
+                c_size_t(len(self.replay_buf)), c_int(0x4000))  # MSG_NOSIGNAL
+            if n == len(self.replay_buf):
+                if self.conns[fd].close_after and not self.conns[fd].upstream:
+                    self.close_fd(fd)
+                return
+            elif n > 0:
+                self.conns[fd].out.extend(self.replay_buf[n:len(self.replay_buf)])
+                self.conns[fd].out_off = 0
+                if not self.conns[fd].want_out:
+                    self.watch(fd, True, False)
+                return
+            elif n < 0 and errno() != EAGAIN:
+                self.close_fd(fd)
+                return
+        self.conns[fd].out.extend(self.replay_buf.copy())
+        self.flush(fd)
 
     def proxy(mut self, client: Int, r: Request, inbuf: List[UInt8], key: String):
         var ufd = self.connect_upstream(client)
@@ -1661,8 +1679,7 @@ struct Proxy:
         var old_len = len(self.conns[client].inbuf)
         if not r.upgrade:
             self.conns[client].state = C_TUNNEL
-            for k in range(r.head_len, len(inbuf)):
-                self.conns[ufd].out.append(inbuf[k])
+            self.conns[ufd].out.extend(inbuf[r.head_len:len(inbuf)])
             self.conns[client].inbuf = List[UInt8]()
             self.inbuf_total -= old_len
         else:
@@ -1684,9 +1701,7 @@ struct Proxy:
         if self.conns[fd].state == C_TUNNEL:
             var peer = self.conns[fd].peer
             if peer >= 0:
-                var data = List[UInt8]()
-                for k in range(n):
-                    data.append(self.tmp[k])
+                var data = List[UInt8](self.tmp[0:n])
                 self.send_bytes(peer, data)
             return
         if len(self.conns[fd].inbuf) + n > MAX_INBUF_BYTES:
@@ -1700,8 +1715,7 @@ struct Proxy:
             self.close_fd(fd)
             return
         self.inbuf_total += n
-        for k in range(n):
-            self.conns[fd].inbuf.append(self.tmp[k])
+        self.conns[fd].inbuf.extend(self.tmp[0:n])
         if self.conns[fd].state == C_IDLE:
             self.process(fd)
 
