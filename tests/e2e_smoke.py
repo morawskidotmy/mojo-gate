@@ -34,6 +34,20 @@ def check(ok: bool, name: str, detail: str = "") -> None:
     print(f"[{mark}] {name}" + (f"  -- {detail}" if detail and not ok else ""))
 
 
+def settle(seconds: float = 0.3) -> None:
+    """Give the proxy time to observe upstream EOF and commit the cache entry."""
+    time.sleep(seconds)
+
+
+def wait_for(predicate, timeout: float = 2.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.05)
+    return predicate()
+
+
 class Upstream:
     """Deterministic HTTP/1.1 upstream that counts requests and records the last body."""
 
@@ -45,6 +59,7 @@ class Upstream:
         self.port = self.sock.getsockname()[1]
         self.counts: dict[str, int] = {}
         self.last_headers: dict[str, str] = {}
+        self.last_raw_headers: list[tuple[str, str]] = []
         self.last_body: bytes = b""
         self.lock = threading.Lock()
         self._stop = False
@@ -59,8 +74,8 @@ class Upstream:
                 break
             threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
 
-    def _handle(self, conn: socket.socket) -> None:
-        conn.settimeout(5)
+    def _handle(self, conn: socket.socket) -> None:  # noqa: C901
+        conn.settimeout(8)
         try:
             data = b""
             while b"\r\n\r\n" not in data:
@@ -73,13 +88,36 @@ class Upstream:
             method, target, _ = lines[0].split(b" ")
             key = method.decode() + " " + target.decode()
             headers: dict[str, str] = {}
+            raw_headers: list[tuple[str, str]] = []
             for line in lines[1:]:
                 if b":" in line:
                     k, v = line.split(b":", 1)
-                    headers[k.decode("latin-1").lower()] = v.strip().decode("latin-1")
+                    name = k.decode("latin-1").lower()
+                    val = v.strip().decode("latin-1")
+                    headers[name] = val
+                    raw_headers.append((name, val))
             cl = int(headers.get("content-length", "0") or "0")
             if headers.get("expect", "").lower() == "100-continue":
                 conn.sendall(b"HTTP/1.1 100 Continue\r\n\r\n")
+            if headers.get("transfer-encoding", "").lower() == "chunked":
+                # Decode a chunked body (used by the tunnel idle test).
+                buf = rest
+                body_bytes = b""
+                while True:
+                    while b"\r\n" not in buf:
+                        buf += conn.recv(65536)
+                    size_line, _, buf = buf.partition(b"\r\n")
+                    size = int(size_line.split(b";")[0], 16)
+                    if size == 0:
+                        while b"\r\n" not in buf:
+                            buf += conn.recv(65536)
+                        break
+                    while len(buf) < size + 2:
+                        buf += conn.recv(65536)
+                    body_bytes += buf[:size]
+                    buf = buf[size + 2:]
+                rest = body_bytes
+                cl = len(body_bytes)
             while len(rest) < cl:
                 more = conn.recv(65536)
                 if not more:
@@ -89,13 +127,23 @@ class Upstream:
                 self.counts[key] = self.counts.get(key, 0) + 1
                 n = self.counts[key]
                 self.last_headers = headers
+                self.last_raw_headers = raw_headers
                 self.last_body = rest[:cl]
             body = b'{"path":"%s","n":%d}' % (target, n)
-            vary = b"vary: accept-language\r\n" if b"/vary" in target else b""
+            extra = b""
+            if b"/cors" in target:
+                origin = headers.get("origin", "")
+                extra += b"vary: origin\r\naccess-control-allow-origin: " + origin.encode("latin-1") + b"\r\n"
+            if b"/enc" in target:
+                extra += b"vary: accept-encoding\r\nx-seen-ae: " + headers.get("accept-encoding", "").encode("latin-1") + b"\r\n"
+            if b"/vary" in target:
+                extra += b"vary: accept-language\r\n"
+            if b"/hints" in target:
+                conn.sendall(b"HTTP/1.1 103 Early Hints\r\nlink: </s.css>; rel=preload\r\n\r\n")
             resp = (
                 b"HTTP/1.1 200 OK\r\n"
                 b"content-type: application/json\r\n"
-                + vary
+                + extra
                 + b"content-length: " + str(len(body)).encode() + b"\r\n"
                 b"\r\n" + body
             )
@@ -109,6 +157,77 @@ class Upstream:
     def count(self, key: str) -> int:
         with self.lock:
             return self.counts.get(key, 0)
+
+    def stop(self) -> None:
+        self._stop = True
+        with contextlib.suppress(OSError):
+            self.sock.close()
+
+
+class UpgradeUpstream:
+    """Raw upstream that completes a WebSocket-style upgrade and records bytes.
+
+    Bytes received before the 101 is sent are recorded in `pre_101`; the proxy
+    must not forward client data until the handshake completes.
+    """
+
+    def __init__(self) -> None:
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(8)
+        self.port = self.sock.getsockname()[1]
+        self.pre_101 = b""
+        self.post_101 = b""
+        self.lock = threading.Lock()
+        self._stop = False
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self) -> None:
+        while not self._stop:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                break
+            threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+
+    def _handle(self, conn: socket.socket) -> None:
+        try:
+            data = b""
+            conn.settimeout(5)
+            while b"\r\n\r\n" not in data:
+                chunk = conn.recv(65536)
+                if not chunk:
+                    return
+                data += chunk
+            _, _, rest = data.partition(b"\r\n\r\n")
+            with self.lock:
+                self.pre_101 += rest
+            conn.settimeout(0.5)
+            with contextlib.suppress(OSError):
+                while True:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        return
+                    with self.lock:
+                        self.pre_101 += chunk
+        except OSError:
+            return
+        # Handshake completes here.
+        with contextlib.suppress(OSError):
+            conn.sendall(
+                b"HTTP/1.1 101 Switching Protocols\r\n"
+                b"upgrade: websocket\r\nconnection: Upgrade\r\n\r\n"
+            )
+            conn.settimeout(5)
+            while True:
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                with self.lock:
+                    self.post_101 += chunk
+        with contextlib.suppress(OSError):
+            conn.close()
 
     def stop(self) -> None:
         self._stop = True
@@ -183,7 +302,6 @@ def main() -> int:
         "--purge-endpoint", "/_mojo_gate/purge",
         "--internal-token", TOKEN,
         "--no-cache-prefixes", "/_mojo_gate",
-        "--analytics-endpoint", "/_mojo_gate/analytics",
     ]
     proc = subprocess.Popen(
         [*base_cmd, "--port", str(port), "--no-rate-limit"],
@@ -204,14 +322,48 @@ def main() -> int:
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         )
         procs.append(ext_proc)
+
+    # Dedicated proxy with a 1s idle timeout to exercise tunnel reaping.
+    idle_port = _free_port()
+    idle_proc = subprocess.Popen(
+        [*base_cmd, "--port", str(idle_port), "--no-rate-limit", "--idle-timeout", "1"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    procs.append(idle_proc)
+
+    # Dedicated proxy with analytics enabled (isolated from the shared upstream).
+    an_port = _free_port()
+    an_proc = subprocess.Popen(
+        [*base_cmd, "--port", str(an_port), "--no-rate-limit",
+         "--analytics-endpoint", "/_mojo_gate/analytics"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    procs.append(an_proc)
+
+    # Dedicated WebSocket-style upgrade upstream + proxy.
+    ws_up = UpgradeUpstream()
+    ws_port = _free_port()
+    ws_proc = subprocess.Popen(
+        [str(binary), "--host", "127.0.0.1", "--port", str(ws_port),
+         "--upstream-host", "127.0.0.1", "--upstream-port", str(ws_up.port),
+         "--no-rate-limit", "--no-cache-prefixes", "/_mojo_gate"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    procs.append(ws_proc)
+
     try:
         _wait_port(port)
         _wait_port(rate_port)
+        _wait_port(idle_port)
+        _wait_port(an_port)
+        _wait_port(ws_port)
         c = RawClient(port)
         r = RawClient(rate_port)
+        ac = RawClient(an_port)
 
         # 1. cache miss then hit
         resp1 = c.get("/api/items/1")
+        settle()
         resp2 = c.get("/api/items/1")
         check(resp1.startswith(b"HTTP/1.1 200"), "GET cache miss 200", resp1[:80].decode(errors="replace"))
         check(up.count("GET /api/items/1") == 1, "second GET served from cache", f"count={up.count('GET /api/items/1')}")
@@ -219,6 +371,8 @@ def main() -> int:
 
         # 2. write flushes cache
         c.request(b"POST /api/items HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc")
+        c.get("/api/items/1")
+        settle()
         c.get("/api/items/1")
         check(up.count("GET /api/items/1") == 2, "POST flushed cache (GET re-fetched)", f"count={up.count('GET /api/items/1')}")
 
@@ -232,7 +386,7 @@ def main() -> int:
         check(tok.startswith(b"HTTP/1.1 200"), "purge with token 200", tok[:60].decode(errors="replace"))
 
         # 4. analytics endpoint blocked from external
-        a = c.get("/_mojo_gate/analytics")
+        a = ac.get("/_mojo_gate/analytics")
         check(a.startswith(b"HTTP/1.1 403"), "direct analytics access forbidden", a[:60].decode(errors="replace"))
 
         # 5. rate limiting
@@ -290,7 +444,8 @@ def main() -> int:
             b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 11\r\n"
             b"Expect: 100-continue\r\nConnection: close\r\n\r\nhello world"
         )
-        check(up.last_body == b"hello world", "Expect body delivered exactly once", repr(up.last_body))
+        settle(0.3)
+        check(wait_for(lambda: up.last_body == b"hello world"), "Expect body delivered exactly once", repr(up.last_body))
 
         # 16. untrusted forwarding headers are stripped (needs a non-loopback peer)
         if ext_ip:
@@ -316,7 +471,9 @@ def main() -> int:
         # 19. cache key is derived from the raw target: non-canonical paths get
         # their own entry and never serve another URL's cached response
         rp1 = c.get("/a/../b")
+        settle()
         rp2 = c.get("/b")
+        settle()
         rp3 = c.get("/a/../b")
         check(up.count("GET /a/../b") == 1, "non-canonical path cached under its own key", f"count={up.count('GET /a/../b')}")
         check(b'"/a/../b"' in rp1, "first non-canonical response correct", rp1[-60:].decode(errors="replace"))
@@ -336,6 +493,85 @@ def main() -> int:
         h = c.request(b"HEAD /api/items/1 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
         check(h.startswith(b"HTTP/1.1 200"), "HEAD 200", h[:60].decode(errors="replace"))
 
+        # 23. Vary: Origin is keyed by full value (no cross-origin poisoning)
+        o1 = c.get("/cors/x", extra="Origin: https://a.example\r\n")
+        settle()
+        o2 = c.get("/cors/x", extra="Origin: https://b.example\r\n")
+        settle()
+        o3 = c.get("/cors/x", extra="Origin: https://a.example\r\n")
+        check(b"access-control-allow-origin: https://a.example" in o1.lower(), "origin A first response correct", o1[:200].decode(errors="replace"))
+        check(up.count("GET /cors/x") == 2, "Vary: Origin keyed per origin", f"count={up.count('GET /cors/x')}")
+        check(b"access-control-allow-origin: https://b.example" in o2.lower(), "origin B gets its own response", o2[:200].decode(errors="replace"))
+        check(b"access-control-allow-origin: https://a.example" in o3.lower(), "origin A cache hit keeps A", o3[:200].decode(errors="replace"))
+
+        # 24. Vary: Accept-Encoding is keyed by full value (gzip vs br)
+        c.get("/enc/x", extra="Accept-Encoding: gzip\r\n")
+        settle()
+        c.get("/enc/x", extra="Accept-Encoding: br\r\n")
+        check(up.count("GET /enc/x") == 2, "Vary: Accept-Encoding keyed per value", f"count={up.count('GET /enc/x')}")
+
+        # 25. duplicate X-Forwarded-For collapses to exactly one header
+        c.get("/dup-xff", extra="X-Forwarded-For: 1.1.1.1\r\nX-Forwarded-For: 2.2.2.2\r\n")
+        xff_count = sum(1 for k, _ in up.last_raw_headers if k == "x-forwarded-for")
+        check(xff_count == 1, "duplicate XFF collapsed to one", f"count={xff_count}")
+
+        # 26. loopback front-proxy: X-Forwarded-Host is reflected in the cache key
+        c.get("/lb/x", extra="X-Forwarded-For: 203.0.113.9\r\nX-Forwarded-Host: a.example\r\n")
+        c.get("/lb/x", extra="X-Forwarded-For: 203.0.113.9\r\nX-Forwarded-Host: b.example\r\n")
+        check(up.count("GET /lb/x") == 2, "loopback X-Forwarded-Host keyed", f"count={up.count('GET /lb/x')}")
+
+        # 27. oversized header block -> 431
+        big = c.request(
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nX-Fill: " + b"a" * 70000
+            + b"\r\nConnection: close\r\n\r\n"
+        )
+        check(big.startswith(b"HTTP/1.1 431"), "oversized headers -> 431", big[:60].decode(errors="replace"))
+
+        # 28. interim 103 is forwarded before the final 200
+        hints = c.get("/hints/x")
+        check(b"HTTP/1.1 103" in hints and b"HTTP/1.1 200" in hints, "103 Early Hints forwarded then 200", hints[:80].decode(errors="replace"))
+        check(b'{"path"' in hints, "200 body framed after interim", hints[-60:].decode(errors="replace"))
+
+        # 29. chunked tunnel survives an idle gap longer than --idle-timeout
+        t = socket.create_connection(("127.0.0.1", idle_port), timeout=20)
+        try:
+            t.sendall(b"POST /chunked HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
+            t.sendall(b"5\r\nhello\r\n")
+            time.sleep(6)
+            t.sendall(b"0\r\n\r\n")
+            t.settimeout(10)
+            out = b""
+            while True:
+                try:
+                    chunk = t.recv(65536)
+                except TimeoutError:
+                    break
+                if not chunk:
+                    break
+                out += chunk
+        finally:
+            t.close()
+        check(out.startswith(b"HTTP/1.1 200"), "chunked tunnel not reaped mid-stream", out[:60].decode(errors="replace"))
+        check(wait_for(lambda: up.last_body == b"hello"), "chunked body delivered intact", repr(up.last_body))
+
+        # 30. WebSocket pre-101 bytes are buffered then delivered in order
+        ws = socket.create_connection(("127.0.0.1", ws_port), timeout=10)
+        try:
+            ws.sendall(
+                b"GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n"
+                b"Connection: Upgrade\r\n\r\nFRAME1"
+            )
+            ws.settimeout(5)
+            hs = b""
+            while b"\r\n\r\n" not in hs:
+                hs += ws.recv(65536)
+            ws.sendall(b"FRAME2")
+            time.sleep(0.5)
+        finally:
+            ws.close()
+        check(ws_up.pre_101 == b"", "no WS bytes sent before 101", repr(ws_up.pre_101))
+        check(ws_up.post_101 == b"FRAME1FRAME2", "WS pre-101 bytes delivered in order", repr(ws_up.post_101))
+
     finally:
         for p in procs:
             p.terminate()
@@ -344,6 +580,7 @@ def main() -> int:
             except subprocess.TimeoutExpired:
                 p.kill()
         up.stop()
+        ws_up.stop()
 
     failed = [n for ok, n in RESULTS if not ok]
     print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")

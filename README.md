@@ -184,5 +184,6 @@ def clear_cache():
 | `--rate-rule` | None | Rate rule formatted as `prefix:limit:window_s` (repeatable) |
 | `--no-rate-limit` | `False` | Disable native rate limiting |
 | `--purge-endpoint` | `/_mojo_gate/purge` | Endpoint to instantly flush cache via `POST` or `DELETE` |
+| `--idle-timeout` | `30` | Seconds before an idle client or stalled upstream connection is reaped |
 | `--no-mojo` | `False` | Bypass Mojo Gate and run Uvicorn alone |
 | `--reload` | `False` | Enable auto-reload (automatically runs Uvicorn alone) |
